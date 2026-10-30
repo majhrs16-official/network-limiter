@@ -9,8 +9,11 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.drawable.Icon;
 import android.net.ConnectivityManager;
+import android.net.LinkAddress;
 import android.net.LinkProperties;
 import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.RouteInfo;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.Handler;
@@ -26,9 +29,12 @@ import org.majhrs16.limiter.core.TunnelEngine;
 import org.majhrs16.limiter.core.VpnConfig;
 
 import java.io.IOException;
+import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.nio.channels.DatagramChannel;
 import java.nio.channels.SocketChannel;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Servicio VPN en primer plano.
@@ -103,11 +109,13 @@ public class LimiterVpnService extends VpnService {
 		});
 		handler = new Handler(Looper.getMainLooper());
 		createChannel();
+		Diag.i(TAG, "Servicio creado");
 	}
 
 	@Override
 	public int onStartCommand(Intent intent, int flags, int startId) {
 		String action = intent == null ? null : intent.getAction();
+		Diag.i(TAG, "onStartCommand action=" + action);
 
 		if (ACTION_STOP.equals(action)) {
 			stopVpn();
@@ -118,6 +126,7 @@ public class LimiterVpnService extends VpnService {
 		if (ACTION_RESTART.equals(action)) {
 			/* El split tunneling se fija al construir la interfaz TUN, así que
 			 * un cambio de apps obliga a recrearla. */
+			Diag.i(TAG, "Reiniciando VPN por cambio de split tunneling");
 			stopVpn();
 			startVpn();
 			return START_STICKY;
@@ -127,6 +136,8 @@ public class LimiterVpnService extends VpnService {
 			if (!running && engine == null) {
 				/* Actualización huérfana: no dejar el servicio vivo sin
 				 * notificación de primer plano. */
+				Diag.w(TAG, "Actualización sin VPN activa; se detiene el servicio",
+						null);
 				stopSelf();
 				return START_NOT_STICKY;
 			}
@@ -152,6 +163,7 @@ public class LimiterVpnService extends VpnService {
 
 	@Override
 	public void onDestroy() {
+		Diag.i(TAG, "Servicio destruido");
 		stopVpn();
 		super.onDestroy();
 	}
@@ -167,6 +179,9 @@ public class LimiterVpnService extends VpnService {
 		VpnConfig config = VpnConfig.load(this);
 		STATS.reset();
 		createChannel();
+		Diag.i(TAG, "Preparando VPN (mtu=" + config.mtu + ", up=" + config.upKbps
+				+ " kbps, down=" + config.downKbps + " kbps, rtt=" + config.rttMs
+				+ " ms, split=" + config.splitMode + ")");
 		try {
 			startForeground(NOTIFICATION_ID, buildNotification());
 		} catch (Exception e) {
@@ -183,9 +198,18 @@ public class LimiterVpnService extends VpnService {
 		builder.setBlocking(true);
 		builder.addAddress("10.111.0.1", 32);
 		builder.addRoute("0.0.0.0", 0);
-		builder.addAddress("fd00:1111::1", 128);
-		builder.addRoute("::", 0);
-		addDnsServers(builder);
+
+		boolean ipv6Available = hasIpv6Connectivity();
+		if (ipv6Available) {
+			builder.addAddress("fd00:1111::1", 128);
+			builder.addRoute("::", 0);
+			Diag.i(TAG, "La red activa tiene IPv6; se anuncia ::/0");
+		} else {
+			/* Sin IPv6 real en la red subyacente, anunciar ::/0 solo
+			 * blackholea el tráfico IPv6 de las apps. */
+			Diag.i(TAG, "La red activa no tiene IPv6 global; no se anuncia ::/0");
+		}
+		addDnsServers(builder, ipv6Available);
 
 		applySplitTunnel(builder, config);
 
@@ -204,6 +228,7 @@ public class LimiterVpnService extends VpnService {
 			stopSelf();
 			return;
 		}
+		Diag.i(TAG, "Interfaz TUN establecida (fd=" + tun.getFd() + ")");
 
 		STATS.reset();
 		engine = new TunnelEngine(tun, new TunnelEngine.Protector() {
@@ -216,7 +241,7 @@ public class LimiterVpnService extends VpnService {
 			public boolean protectDatagram(DatagramChannel channel) {
 				return LimiterVpnService.this.protect(channel.socket());
 			}
-		}, config, STATS);
+		}, config, STATS, new AndroidIcmpProbe());
 
 		try {
 			engine.start();
@@ -286,18 +311,25 @@ public class LimiterVpnService extends VpnService {
 				}
 			}
 			if (added > 0) {
+				Diag.i(TAG, "Split tunneling: solo " + added + " app(s) permitidas");
 				return;
 			}
 			/* Modo inclusivo sin apps válidas: se comporta como "todas". */
+			Diag.i(TAG, "Split tunneling inclusivo sin apps válidas; se enrutan todas");
 		}
 
 		addDisallowedApplication(builder, self);
 		if (config.splitMode == VpnConfig.SPLIT_EXCLUDE) {
+			int added = 0;
 			for (String pkg : config.splitPackages) {
 				if (!self.equals(pkg)) {
 					addDisallowedApplication(builder, pkg);
+					added++;
 				}
 			}
+			Diag.i(TAG, "Split tunneling: todas excepto " + added + " app(s)");
+		} else {
+			Diag.i(TAG, "Split tunneling: todas las apps (la propia queda fuera)");
 		}
 	}
 
@@ -385,45 +417,171 @@ public class LimiterVpnService extends VpnService {
 
 	/* ----------------------------- utilidades -------------------------- */
 
-	private void addDnsServers(Builder builder) {
-		boolean added = false;
+	private void addDnsServers(Builder builder, boolean ipv6Available) {
+		List<InetAddress> candidates = new ArrayList<>();
 		try {
 			ConnectivityManager cm = getSystemService(ConnectivityManager.class);
-			Network active = cm == null ? null : cm.getActiveNetwork();
+			Network active = findUnderlyingNetwork(cm);
 			LinkProperties properties = active == null ? null : cm.getLinkProperties(active);
 			if (properties != null) {
-				int count = 0;
-				for (InetAddress dns : properties.getDnsServers()) {
-					if (count >= 4) {
-						break;
-					}
-					/* Un DNS link-local/multicast no es enrutable por el
-					 * túnel (necesita scope de interfaz) y el motor lo
-					 * filtraría; es mejor no anunciarlo. */
-					if (dns.isLinkLocalAddress() || dns.isLoopbackAddress()
-							|| dns.isAnyLocalAddress() || dns.isMulticastAddress()) {
-						continue;
-					}
-					try {
-						builder.addDnsServer(dns);
-						added = true;
-						count++;
-					} catch (Exception ignored) {
-						/* dirección no soportada */
-					}
-				}
+				candidates.addAll(properties.getDnsServers());
 			}
-		} catch (Exception e) {
-			Diag.w(TAG, "No se pudieron leer los DNS de la red activa", e);
+		} catch (Throwable error) {
+			Diag.w(TAG, "No se pudieron leer los DNS de la red activa", error);
 		}
 
-		if (!added) {
-			try {
-				builder.addDnsServer("1.1.1.1");
-				builder.addDnsServer("8.8.8.8");
-			} catch (Exception ignored) {
-				/* nada */
+		int ipv4Added = 0;
+		int ipv6Added = 0;
+		for (InetAddress dns : candidates) {
+			if (dns == null) {
+				continue;
 			}
+			if (isUnroutableDns(dns)) {
+				Diag.w(TAG, "DNS no enrutable por el túnel; se omite: "
+						+ dns.getHostAddress(), null);
+				continue;
+			}
+			boolean isIpv6 = dns instanceof Inet6Address;
+			if (isIpv6 && !ipv6Available) {
+				Diag.i(TAG, "DNS IPv6 omitido porque la red activa no tiene IPv6: "
+						+ dns.getHostAddress());
+				continue;
+			}
+			if (ipv4Added + ipv6Added >= 4) {
+				break;
+			}
+			try {
+				builder.addDnsServer(dns);
+				if (isIpv6) {
+					ipv6Added++;
+				} else {
+					ipv4Added++;
+				}
+				Diag.i(TAG, "DNS del túnel: " + dns.getHostAddress()
+						+ (isIpv6 ? " (IPv6)" : " (IPv4)"));
+			} catch (Throwable error) {
+				Diag.w(TAG, "No se pudo anunciar el DNS " + dns.getHostAddress(),
+						error);
+			}
+		}
+
+		if (ipv4Added == 0) {
+			/* Si la red solo ofrece DNS IPv6 (o ninguno), un resolver IPv4
+			 * público evita que toda la resolución dependa de IPv6. */
+			addFallbackDns(builder, "1.1.1.1");
+			addFallbackDns(builder, "8.8.8.8");
+		}
+		if (ipv4Added + ipv6Added == 0) {
+			Diag.w(TAG, "No se pudo anunciar ningún DNS; la resolución puede fallar",
+					null);
+		}
+	}
+
+	private void addFallbackDns(Builder builder, String address) {
+		try {
+			builder.addDnsServer(address);
+			Diag.i(TAG, "DNS de respaldo: " + address);
+		} catch (Throwable error) {
+			Diag.w(TAG, "No se pudo añadir el DNS de respaldo " + address, error);
+		}
+	}
+
+	private static boolean isUnroutableDns(InetAddress dns) {
+		if (dns.isLinkLocalAddress() || dns.isLoopbackAddress()
+				|| dns.isAnyLocalAddress() || dns.isMulticastAddress()) {
+			return true;
+		}
+		byte[] raw = dns.getAddress();
+		if (raw.length == 4) {
+			/* 10.111.0.0/24 es la propia interfaz TUN. */
+			return (raw[0] & 0xFF) == 10 && (raw[1] & 0xFF) == 111
+					&& (raw[2] & 0xFF) == 0;
+		}
+		if (raw.length == 16) {
+			/* fd00:1111::/64 es la propia interfaz TUN. */
+			return (raw[0] & 0xFF) == 0xFD && (raw[1] & 0xFF) == 0x00
+					&& (raw[2] & 0xFF) == 0x11 && (raw[3] & 0xFF) == 0x11;
+		}
+		return false;
+	}
+
+	private boolean hasIpv6Connectivity() {
+		try {
+			ConnectivityManager cm = getSystemService(ConnectivityManager.class);
+			Network active = findUnderlyingNetwork(cm);
+			LinkProperties properties = active == null ? null
+					: cm.getLinkProperties(active);
+			if (properties == null) {
+				return false;
+			}
+			boolean hasGlobalAddress = false;
+			for (LinkAddress link : properties.getLinkAddresses()) {
+				InetAddress address = link.getAddress();
+				if (address instanceof Inet6Address
+						&& !address.isLinkLocalAddress()
+						&& !address.isLoopbackAddress()
+						&& !address.isAnyLocalAddress()) {
+					hasGlobalAddress = true;
+					break;
+				}
+			}
+			if (!hasGlobalAddress) {
+				return false;
+			}
+			/* Sin una ruta por defecto IPv6, anunciar ::/0 dejaría a las
+			 * apps intentando conexiones que nunca salen. */
+			for (RouteInfo route : properties.getRoutes()) {
+				if (route == null || !route.isDefaultRoute()) {
+					continue;
+				}
+				InetAddress destination = route.getDestination() == null
+						? null
+						: route.getDestination().getAddress();
+				if (destination instanceof Inet6Address) {
+					return true;
+				}
+			}
+		} catch (Throwable error) {
+			Diag.w(TAG, "No se pudo comprobar el IPv6 de la red activa", error);
+		}
+		return false;
+	}
+
+	private Network findUnderlyingNetwork(ConnectivityManager cm) {
+		if (cm == null) {
+			return null;
+		}
+		try {
+			Network active = cm.getActiveNetwork();
+			NetworkCapabilities activeCaps = active == null ? null
+					: cm.getNetworkCapabilities(active);
+			if (activeCaps != null
+					&& !activeCaps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+				return active;
+			}
+
+			/* Al reiniciar, getActiveNetwork() puede devolver todavía
+			 * nuestra propia VPN. Se busca la red real con Internet. */
+			Network fallback = null;
+			for (Network network : cm.getAllNetworks()) {
+				NetworkCapabilities caps = cm.getNetworkCapabilities(network);
+				if (caps == null
+						|| caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+						|| !caps.hasCapability(
+								NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+					continue;
+				}
+				if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+					return network;
+				}
+				if (fallback == null) {
+					fallback = network;
+				}
+			}
+			return fallback != null ? fallback : active;
+		} catch (Throwable error) {
+			Diag.w(TAG, "No se pudo identificar la red subyacente", error);
+			return null;
 		}
 	}
 

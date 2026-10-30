@@ -663,6 +663,132 @@
 					android:textSize="14sp"
 					android:textStyle="bold" />
 			</LinearLayout>
+
+			<!-- Página 2: registros de ejecución -->
+			<LinearLayout
+				android:layout_width="match_parent"
+				android:layout_height="match_parent"
+				android:orientation="vertical"
+				android:paddingStart="20dp"
+				android:paddingTop="20dp"
+				android:paddingEnd="20dp"
+				android:paddingBottom="12dp">
+
+				<TextView
+					android:layout_width="wrap_content"
+					android:layout_height="wrap_content"
+					android:text="@string/logs_title"
+					android:textColor="@color/text"
+					android:textSize="22sp"
+					android:textStyle="bold" />
+
+				<TextView
+					android:id="@+id/logs_subtitle"
+					android:layout_width="match_parent"
+					android:layout_height="wrap_content"
+					android:layout_marginTop="4dp"
+					android:text="@string/logs_subtitle"
+					android:textColor="@color/muted"
+					android:textSize="12sp" />
+
+				<LinearLayout
+					android:layout_width="match_parent"
+					android:layout_height="wrap_content"
+					android:layout_marginTop="8dp"
+					android:gravity="center_vertical"
+					android:orientation="horizontal">
+
+					<CheckBox
+						android:id="@+id/logs_packet_trace"
+						android:layout_width="0dp"
+						android:layout_height="wrap_content"
+						android:layout_weight="1"
+						android:buttonTint="@color/accent"
+						android:text="@string/logs_packet_trace"
+						android:textColor="@color/muted"
+						android:textSize="12sp" />
+
+					<CheckBox
+						android:id="@+id/logs_autoscroll"
+						android:layout_width="wrap_content"
+						android:layout_height="wrap_content"
+						android:buttonTint="@color/accent"
+						android:checked="true"
+						android:text="@string/logs_autoscroll"
+						android:textColor="@color/muted"
+						android:textSize="12sp" />
+				</LinearLayout>
+
+				<LinearLayout
+					android:layout_width="match_parent"
+					android:layout_height="wrap_content"
+					android:layout_marginTop="4dp"
+					android:orientation="horizontal"
+					tools:ignore="ButtonStyle">
+
+					<Button
+						android:id="@+id/logs_clear"
+						android:layout_width="0dp"
+						android:layout_height="40dp"
+						android:layout_marginEnd="4dp"
+						android:layout_weight="1"
+						android:background="@drawable/button_ghost"
+						android:backgroundTint="@null"
+						android:text="@string/logs_clear"
+						android:textAllCaps="false"
+						android:textColor="@color/muted"
+						android:textSize="12sp" />
+
+					<Button
+						android:id="@+id/logs_copy"
+						android:layout_width="0dp"
+						android:layout_height="40dp"
+						android:layout_marginStart="4dp"
+						android:layout_weight="1"
+						android:background="@drawable/button_ghost"
+						android:backgroundTint="@null"
+						android:text="@string/logs_copy"
+						android:textAllCaps="false"
+						android:textColor="@color/muted"
+						android:textSize="12sp" />
+				</LinearLayout>
+
+				<FrameLayout
+					android:layout_width="match_parent"
+					android:layout_height="0dp"
+					android:layout_marginTop="8dp"
+					android:layout_weight="1">
+
+					<ListView
+						android:id="@+id/logs_list"
+						android:layout_width="match_parent"
+						android:layout_height="match_parent"
+						android:divider="@color/stroke"
+						android:dividerHeight="1dp"
+						android:listSelector="@android:color/transparent"
+						android:scrollbars="vertical"
+						android:stackFromBottom="true"
+						android:transcriptMode="normal" />
+
+					<TextView
+						android:id="@+id/logs_empty"
+						android:layout_width="match_parent"
+						android:layout_height="match_parent"
+						android:gravity="center"
+						android:padding="24dp"
+						android:text="@string/logs_empty"
+						android:textColor="@color/muted"
+						android:textSize="13sp" />
+				</FrameLayout>
+
+				<TextView
+					android:id="@+id/logs_footer"
+					android:layout_width="match_parent"
+					android:layout_height="wrap_content"
+					android:layout_marginTop="6dp"
+					android:textColor="@color/muted"
+					android:textSize="11sp" />
+			</LinearLayout>
 		</ViewFlipper>
 	</LinearLayout>
 
@@ -739,6 +865,18 @@
 			android:paddingStart="20dp"
 			android:paddingEnd="20dp"
 			android:text="@string/nav_split"
+			android:textColor="@color/text"
+			android:textSize="15sp" />
+
+		<TextView
+			android:id="@+id/nav_logs"
+			android:layout_width="match_parent"
+			android:layout_height="48dp"
+			android:background="?attr/selectableItemBackground"
+			android:gravity="center_vertical"
+			android:paddingStart="20dp"
+			android:paddingEnd="20dp"
+			android:text="@string/nav_logs"
 			android:textColor="@color/text"
 			android:textSize="15sp" />
 

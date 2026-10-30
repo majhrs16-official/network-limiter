@@ -5,6 +5,8 @@ import android.os.ParcelFileDescriptor;
 import org.majhrs16.limiter.core.net.Delivery;
 import org.majhrs16.limiter.core.net.FlowKey;
 import org.majhrs16.limiter.core.net.Icmp;
+import org.majhrs16.limiter.core.net.IcmpForwarder;
+import org.majhrs16.limiter.core.net.IcmpProbe;
 import org.majhrs16.limiter.core.net.IpPacket;
 import org.majhrs16.limiter.core.net.TcpSegment;
 import org.majhrs16.limiter.core.net.UdpDatagram;
@@ -19,9 +21,9 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.StandardProtocolFamily;
 import java.nio.ByteBuffer;
 import java.nio.channels.CancelledKeyException;
-import java.nio.channels.ClosedChannelException;
 import java.nio.channels.ClosedSelectorException;
 import java.nio.channels.DatagramChannel;
 import java.nio.channels.SelectionKey;
@@ -66,6 +68,7 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 	private final ParcelFileDescriptor tunPfd;
 	private final Protector protector;
 	private final Stats stats;
+	private final IcmpProbe icmpProbe;
 	private final ArrayBlockingQueue<byte[]> inbox = new ArrayBlockingQueue<>(2048);
 	private final Map<FlowKey, TcpConnection> tcp = new HashMap<>();
 	private final Map<FlowKey, UdpFlow> udp = new HashMap<>();
@@ -82,17 +85,23 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 	private CakeQueue downQueue;
 	private CakeShaper upShaper;
 	private CakeShaper downShaper;
-	private final AtomicLong icmpId = new AtomicLong(1);
+	private IcmpForwarder icmpForwarder;
 	/** Bytes de subida aceptados y aún no entregados al socket. */
 	private final AtomicLong upPending = new AtomicLong();
 	private final ByteBuffer udpReadBuffer = ByteBuffer.allocate(65535);
 
 	public TunnelEngine(ParcelFileDescriptor tunPfd, Protector protector, VpnConfig config,
 			Stats stats) {
+		this(tunPfd, protector, config, stats, null);
+	}
+
+	public TunnelEngine(ParcelFileDescriptor tunPfd, Protector protector, VpnConfig config,
+			Stats stats, IcmpProbe icmpProbe) {
 		this.tunPfd = tunPfd;
 		this.protector = protector;
 		this.config = config.copy();
 		this.stats = stats;
+		this.icmpProbe = icmpProbe;
 	}
 
 	public void start() throws IOException {
@@ -120,6 +129,11 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 		upShaper.start();
 		downShaper.start();
 
+		if (icmpProbe != null) {
+			icmpForwarder = new IcmpForwarder(icmpProbe, this::enqueueIcmpReply);
+			icmpForwarder.start();
+		}
+
 		readerThread = new Thread(this::readLoop, "tun-reader");
 		readerThread.setDaemon(true);
 		readerThread.start();
@@ -138,6 +152,11 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 		}
 		running = false;
 		Diag.i(TAG, "Deteniendo motor");
+
+		if (icmpForwarder != null) {
+			icmpForwarder.stop();
+			icmpForwarder = null;
+		}
 
 		Selector s = selector;
 		if (s != null) {
@@ -199,13 +218,18 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 
 	private void readLoop() {
 		byte[] buffer = new byte[Math.max(config.mtu + 256, 2048)];
+		FileInputStream input = tunIn;
+		if (input == null) {
+			Diag.e(TAG, "Lector del TUN sin flujo de entrada", null);
+			return;
+		}
 		while (running) {
 			int read;
 			try {
-				read = tunIn.read(buffer);
-			} catch (IOException e) {
+				read = input.read(buffer);
+			} catch (Throwable error) {
 				if (running) {
-					Diag.w(TAG, "Lectura del TUN terminó", e);
+					Diag.w(TAG, "Lectura del TUN terminó", error);
 				}
 				break;
 			}
@@ -215,6 +239,9 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 			byte[] packet = Arrays.copyOf(buffer, read);
 			if (!inbox.offer(packet)) {
 				stats.dropped.incrementAndGet();
+				if (Diag.isPacketTrace()) {
+					Diag.w(TAG, "Buzón del TUN lleno; paquete descartado (" + read + " bytes)");
+				}
 				continue;
 			}
 			Selector s = selector;
@@ -228,12 +255,16 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 	public void run() {
 		long lastTick = 0;
 		long lastSample = 0;
-		try {
-			while (running) {
-				selector.select(50);
+		while (running) {
+			try {
+				Selector s = selector;
+				if (s == null) {
+					break;
+				}
+				s.select(50);
 				long now = System.nanoTime();
 
-				Iterator<SelectionKey> iterator = selector.selectedKeys().iterator();
+				Iterator<SelectionKey> iterator = s.selectedKeys().iterator();
 				while (iterator.hasNext()) {
 					SelectionKey key = iterator.next();
 					iterator.remove();
@@ -249,15 +280,27 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 				}
 				if (now - lastSample >= 1_000_000_000L) {
 					stats.sample();
-					stats.upQueueBytes.set(upQueue.backlogBytes());
-					stats.downQueueBytes.set(downQueue.backlogBytes());
+					if (upQueue != null) {
+						stats.upQueueBytes.set(upQueue.backlogBytes());
+					}
+					if (downQueue != null) {
+						stats.downQueueBytes.set(downQueue.backlogBytes());
+					}
 					lastSample = now;
 				}
+			} catch (ClosedSelectorException ignored) {
+				break;
+			} catch (Throwable error) {
+				/* Un paquete o un socket defectuoso no debe tumbar todo el
+				 * túnel. Se registra y se sigue atendiendo el resto. */
+				Diag.e(TAG, "Iteración del motor falló; se continúa", error);
+				try {
+					Thread.sleep(10);
+				} catch (InterruptedException interrupted) {
+					Thread.currentThread().interrupt();
+					break;
+				}
 			}
-		} catch (ClosedSelectorException ignored) {
-			/* parada normal */
-		} catch (Throwable t) {
-			Diag.e(TAG, "El bucle del motor falló", t);
 		}
 	}
 
@@ -303,7 +346,13 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 			if (packet == null) {
 				return;
 			}
-			handlePacket(packet, now);
+			try {
+				handlePacket(packet, now);
+			} catch (Throwable error) {
+				stats.badPackets.incrementAndGet();
+				Diag.e(TAG, "Paquete descartado por error (" + packet.length
+						+ " bytes)", error);
+			}
 		}
 	}
 
@@ -313,23 +362,45 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 	 */
 	private void refreshInterests() {
 		for (TcpConnection connection : tcp.values()) {
-			connection.updateInterest();
+			try {
+				connection.updateInterest();
+			} catch (Throwable error) {
+				Diag.w(TAG, "No se pudo actualizar el interés de un TCP", error);
+			}
 		}
 		for (UdpFlow flow : udp.values()) {
-			flow.updateInterest();
+			try {
+				flow.updateInterest();
+			} catch (Throwable error) {
+				Diag.w(TAG, "No se pudo actualizar el interés de un UDP", error);
+			}
 		}
 	}
 
 	private void timers(long now) {
 		for (TcpConnection connection : new ArrayList<>(tcp.values())) {
-			connection.onTimer(now);
+			try {
+				connection.onTimer(now);
+			} catch (Throwable error) {
+				Diag.w(TAG, "Temporizador TCP falló; se cierra la conexión", error);
+				connection.close(true, now);
+			}
 		}
 		for (UdpFlow flow : new ArrayList<>(udp.values())) {
-			flow.onTimer(now);
+			try {
+				flow.onTimer(now);
+			} catch (Throwable error) {
+				Diag.w(TAG, "Temporizador UDP falló; se cierra el flujo", error);
+				flow.close(now);
+			}
 		}
-		stats.upQueueBytes.set(upQueue.backlogBytes());
-		stats.downQueueBytes.set(downQueue.backlogBytes());
-		stats.aqmDrops.set(downQueue.aqmDroppedPackets());
+		if (upQueue != null) {
+			stats.upQueueBytes.set(upQueue.backlogBytes());
+		}
+		if (downQueue != null) {
+			stats.downQueueBytes.set(downQueue.backlogBytes());
+			stats.aqmDrops.set(downQueue.aqmDroppedPackets());
+		}
 	}
 
 	/* --------------------------- paquetes ------------------------------ */
@@ -338,10 +409,16 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 		IpPacket ip = IpPacket.parse(packet);
 		if (ip == null) {
 			stats.badPackets.incrementAndGet();
+			if (Diag.isPacketTrace()) {
+				Diag.w(TAG, "Paquete IP inválido del TUN (" + packet.length + " bytes)");
+			}
 			return;
 		}
 		stats.upBytes.addAndGet(packet.length);
 		stats.upPackets.incrementAndGet();
+		if (Diag.isPacketTrace()) {
+			Diag.d(TAG, "TUN↑ " + describe(ip) + " len=" + packet.length);
+		}
 
 		switch (ip.protocol) {
 			case IpPacket.PROTO_TCP: {
@@ -381,14 +458,25 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 			if (segment.has(TcpSegment.SYN) && !segment.has(TcpSegment.ACK)
 					&& !segment.has(TcpSegment.RST)) {
 				if (tcp.size() >= MAX_TCP) {
+					Diag.w(TAG, "Límite de conexiones TCP alcanzado; RST a "
+							+ address(ip.dst) + ":" + segment.dstPort);
 					sendRst(ip, segment);
 					stats.dropped.incrementAndGet();
 					return;
 				}
+				Diag.d(TAG, "TCP SYN " + address(ip.src) + ":" + segment.srcPort
+						+ " → " + address(ip.dst) + ":" + segment.dstPort);
 				connection = new TcpConnection(this, key, ip, segment, now);
 				tcp.put(key, connection);
 				stats.tcpConnections.incrementAndGet();
-				connection.open(now);
+				try {
+					connection.open(now);
+				} catch (Throwable error) {
+					Diag.e(TAG, "No se pudo abrir el TCP hacia " + address(ip.dst)
+							+ ":" + segment.dstPort, error);
+					connection.close(true, now);
+					return;
+				}
 				if (!connection.isClosed()) {
 					register(connection);
 				}
@@ -398,13 +486,21 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 			return;
 		}
 
-		connection.onSegment(ip, segment, now);
+		try {
+			connection.onSegment(ip, segment, now);
+		} catch (Throwable error) {
+			Diag.w(TAG, "Segmento TCP falló; se cierra " + key, error);
+			connection.close(true, now);
+		}
 	}
 
 	private void handleUdp(IpPacket ip, UdpDatagram datagram, long now) {
 		if (isLocalOnly(ip.dst)) {
 			/* mDNS, SSDP, DHCP, descubrimiento IPv6: no salen del enlace. */
 			stats.dropped.incrementAndGet();
+			if (Diag.isPacketTrace()) {
+				Diag.d(TAG, "UDP local descartado " + describe(ip));
+			}
 			return;
 		}
 		FlowKey key = new FlowKey(ip.src, datagram.srcPort, ip.dst, datagram.dstPort,
@@ -413,27 +509,63 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 
 		if (flow == null) {
 			if (udp.size() >= MAX_UDP) {
+				Diag.w(TAG, "Límite de flujos UDP alcanzado; se descarta "
+						+ address(ip.dst) + ":" + datagram.dstPort);
 				stats.dropped.incrementAndGet();
 				return;
 			}
+			DatagramChannel channel = null;
 			try {
-				DatagramChannel channel = DatagramChannel.open();
+				channel = openDatagram(ip.isIpv6());
 				channel.configureBlocking(false);
-				if (!protector.protectDatagram(channel)) {
-					channel.close();
-					return;
+
+				boolean protectedSocket = false;
+				try {
+					protectedSocket = protector.protectDatagram(channel);
+				} catch (Throwable error) {
+					Diag.w(TAG, "protect() lanzó para UDP " + address(ip.dst)
+							+ ":" + datagram.dstPort, error);
 				}
+				if (!protectedSocket) {
+					/* La app siempre está excluida de la VPN, así que el
+					 * socket ya usa la red subyacente. No se aborta por un
+					 * protect() fallido. */
+					Diag.w(TAG, "protect() devolvió false para UDP "
+							+ address(ip.dst) + ":" + datagram.dstPort
+							+ "; se continúa");
+				}
+
 				channel.connect(new InetSocketAddress(
 						InetAddress.getByAddress(ip.dst), datagram.dstPort));
 				flow = new UdpFlow(this, key, channel, now);
-				udp.put(key, flow);
 				SelectionKey selection = channel.register(selector, 0, flow);
 				flow.attach(selection);
+				udp.put(key, flow);
 				flow.updateInterest();
 				stats.udpFlows.incrementAndGet();
-			} catch (IOException e) {
-				Diag.w(TAG, "No se pudo abrir UDP hacia " + key, e);
+
+				if (datagram.dstPort == 53) {
+					Diag.i(TAG, "DNS consulta " + address(ip.src) + " → "
+							+ address(ip.dst) + ":" + datagram.dstPort + " ("
+							+ datagram.payloadLength + " bytes)");
+				} else {
+					Diag.d(TAG, "UDP flujo " + address(ip.src) + ":" + datagram.srcPort
+							+ " → " + address(ip.dst) + ":" + datagram.dstPort);
+				}
+			} catch (Throwable error) {
+				Diag.w(TAG, "No se pudo abrir UDP hacia " + address(ip.dst)
+						+ ":" + datagram.dstPort, error);
 				stats.dropped.incrementAndGet();
+				if (flow != null && udp.remove(key) != null) {
+					stats.udpFlows.decrementAndGet();
+				}
+				if (channel != null) {
+					try {
+						channel.close();
+					} catch (Throwable ignored) {
+						/* nada */
+					}
+				}
 				return;
 			}
 		}
@@ -444,17 +576,49 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 		enqueueUpload(flow, payload, payload.length + overhead);
 	}
 
+	/**
+	 * Abre un canal de la familia exacta del destino. Android usa por defecto
+	 * un canal INET6 dual-stack; pedir la familia explícita evita depender de
+	 * ese detalle en redes IPv4-only.
+	 */
+	private static DatagramChannel openDatagram(boolean ipv6) throws IOException {
+		try {
+			return DatagramChannel.open(ipv6
+					? StandardProtocolFamily.INET6
+					: StandardProtocolFamily.INET);
+		} catch (UnsupportedOperationException error) {
+			Diag.w(TAG, "Familia " + (ipv6 ? "INET6" : "INET")
+					+ " no soportada para UDP; se usa el canal por defecto", error);
+			return DatagramChannel.open();
+		}
+	}
+
 	private void handleIcmp(IpPacket ip) {
 		if (isLocalOnly(ip.dst)) {
+			stats.dropped.incrementAndGet();
 			return;
 		}
-		byte[] reply = Icmp.buildEchoReply(ip);
-		if (reply != null) {
-			FlowKey flow = new FlowKey(ip.dst, 0, ip.src, 0, ip.protocol);
-			enqueueDownload(reply, flow, NOOP);
-		} else if (Icmp.isEchoRequest(ip)) {
+		if (!Icmp.isEchoRequest(ip)) {
+			/* Los errores ICMP y otros tipos no se contestan localmente. */
 			stats.dropped.incrementAndGet();
+			return;
 		}
+		IcmpForwarder forwarder = icmpForwarder;
+		if (forwarder == null) {
+			stats.dropped.incrementAndGet();
+			return;
+		}
+		Diag.d(TAG, "ICMP eco hacia " + address(ip.dst) + " ("
+				+ ip.payloadLength + " bytes)");
+		forwarder.submit(ip);
+	}
+
+	private void enqueueIcmpReply(byte[] packet, FlowKey flow) {
+		if (!running) {
+			stats.dropped.incrementAndGet();
+			return;
+		}
+		enqueueDownload(packet, flow, NOOP);
 	}
 
 	/** Direcciones que no tienen sentido fuera del enlace local. */
@@ -475,6 +639,37 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 		}
 		/* link-local unicast fe80::/10 */
 		return (dst[0] & 0xFF) == 0xFE && (dst[1] & 0xC0) == 0x80;
+	}
+
+	private static String describe(IpPacket ip) {
+		String protocol;
+		switch (ip.protocol) {
+			case IpPacket.PROTO_TCP:
+				protocol = "TCP";
+				break;
+			case IpPacket.PROTO_UDP:
+				protocol = "UDP";
+				break;
+			case IpPacket.PROTO_ICMP:
+				protocol = "ICMP";
+				break;
+			case IpPacket.PROTO_ICMPV6:
+				protocol = "ICMPv6";
+				break;
+			default:
+				protocol = "proto=" + ip.protocol;
+				break;
+		}
+		return "IPv" + (ip.isIpv6() ? "6" : "4") + " " + protocol + " "
+				+ address(ip.src) + " → " + address(ip.dst);
+	}
+
+	private static String address(byte[] raw) {
+		try {
+			return InetAddress.getByAddress(raw).getHostAddress();
+		} catch (Throwable ignored) {
+			return "?";
+		}
 	}
 
 	private void sendRst(IpPacket ip, TcpSegment segment) {
@@ -503,7 +698,8 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 			SelectionKey selection = connection.channel().register(selector, 0, connection);
 			connection.attach(selection);
 			connection.updateInterest();
-		} catch (ClosedChannelException e) {
+		} catch (Throwable error) {
+			Diag.w(TAG, "No se pudo registrar el TCP en el selector", error);
 			connection.close(true, System.nanoTime());
 		}
 	}
@@ -511,33 +707,52 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 	/* ---------------------------- shapers ------------------------------ */
 
 	private void deliverUpload(CakeQueue.Item item) {
+		if (item == null || item.data == null) {
+			return;
+		}
 		upPending.addAndGet(-item.data.length);
 		Object tag = item.tag;
-		if (tag instanceof TcpConnection) {
-			((TcpConnection) tag).onUploadReady(item.data);
-		} else if (tag instanceof UdpFlow) {
-			((UdpFlow) tag).onUploadReady(item.data);
+		try {
+			if (tag instanceof TcpConnection) {
+				((TcpConnection) tag).onUploadReady(item.data);
+			} else if (tag instanceof UdpFlow) {
+				((UdpFlow) tag).onUploadReady(item.data);
+			}
+		} catch (Throwable error) {
+			stats.dropped.incrementAndGet();
+			Diag.w(TAG, "Fallo entregando datos de subida", error);
 		}
 	}
 
 	private void deliverDownload(CakeQueue.Item item) {
+		if (item == null || item.data == null) {
+			return;
+		}
 		boolean sent = false;
 		try {
-			tunOut.write(item.data, 0, item.data.length);
+			FileOutputStream output = tunOut;
+			if (output == null) {
+				throw new IOException("TUN de salida cerrado");
+			}
+			output.write(item.data, 0, item.data.length);
 			stats.downBytes.addAndGet(item.data.length);
 			stats.downPackets.incrementAndGet();
 			sent = true;
-		} catch (IOException e) {
+		} catch (Throwable error) {
 			if (running) {
-				Diag.w(TAG, "Escritura al TUN falló", e);
+				Diag.w(TAG, "Escritura al TUN falló", error);
 			}
 		}
 		if (item.tag instanceof Delivery) {
 			Delivery delivery = (Delivery) item.tag;
-			if (sent) {
-				delivery.onSent();
-			} else {
-				delivery.onDropped();
+			try {
+				if (sent) {
+					delivery.onSent();
+				} else {
+					delivery.onDropped();
+				}
+			} catch (Throwable error) {
+				Diag.w(TAG, "Callback de entrega falló", error);
 			}
 		}
 	}
@@ -545,27 +760,69 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 	@Override
 	public void enqueueDownload(byte[] packet, FlowKey flow, Delivery delivery) {
 		Delivery d = delivery == null ? NOOP : delivery;
+		CakeQueue queue = downQueue;
+		if (queue == null) {
+			stats.dropped.incrementAndGet();
+			d.onDropped();
+			return;
+		}
 		CakeQueue.Item item = new CakeQueue.Item(flow, packet, packet.length, d,
-				() -> d.onDropped());
-		downQueue.enqueue(item, System.nanoTime());
+				() -> {
+					stats.dropped.incrementAndGet();
+					if (Diag.isPacketTrace()) {
+						Diag.d(TAG, "Descarte down " + flow);
+					}
+					d.onDropped();
+				});
+		try {
+			queue.enqueue(item, System.nanoTime());
+		} catch (Throwable error) {
+			stats.dropped.incrementAndGet();
+			Diag.w(TAG, "No se pudo encolar el paquete de bajada", error);
+			d.onDropped();
+		}
 	}
 
 	@Override
 	public void enqueueUpload(TcpConnection connection, byte[] payload, int wireLength) {
+		CakeQueue queue = upQueue;
+		if (queue == null) {
+			stats.dropped.incrementAndGet();
+			connection.onUploadDropped(payload.length);
+			return;
+		}
 		upPending.addAndGet(payload.length);
 		CakeQueue.Item item = new CakeQueue.Item(connection.key(), payload, wireLength,
 				connection, () -> {
 					upPending.addAndGet(-payload.length);
 					connection.onUploadDropped(payload.length);
 				});
-		upQueue.enqueue(item, System.nanoTime());
+		try {
+			queue.enqueue(item, System.nanoTime());
+		} catch (Throwable error) {
+			upPending.addAndGet(-payload.length);
+			connection.onUploadDropped(payload.length);
+			stats.dropped.incrementAndGet();
+			Diag.w(TAG, "No se pudo encolar datos TCP de subida", error);
+		}
 	}
 
 	private void enqueueUpload(UdpFlow flow, byte[] payload, int wireLength) {
+		CakeQueue queue = upQueue;
+		if (queue == null) {
+			stats.dropped.incrementAndGet();
+			return;
+		}
 		upPending.addAndGet(payload.length);
 		CakeQueue.Item item = new CakeQueue.Item(flow.key(), payload, wireLength, flow,
 				() -> upPending.addAndGet(-payload.length));
-		upQueue.enqueue(item, System.nanoTime());
+		try {
+			queue.enqueue(item, System.nanoTime());
+		} catch (Throwable error) {
+			upPending.addAndGet(-payload.length);
+			stats.dropped.incrementAndGet();
+			Diag.w(TAG, "No se pudo encolar datos UDP de subida", error);
+		}
 	}
 
 	/* --------------------------- callbacks ----------------------------- */
@@ -586,7 +843,13 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 
 	@Override
 	public boolean protect(SocketChannel channel) {
-		return protector.protectSocket(channel);
+		try {
+			return protector.protectSocket(channel);
+		} catch (Throwable error) {
+			Diag.w(TAG, "protect() lanzó para TCP; se continúa (la app está "
+					+ "excluida de la VPN)", error);
+			return false;
+		}
 	}
 
 	@Override

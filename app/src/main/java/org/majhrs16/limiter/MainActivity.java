@@ -2,6 +2,8 @@ package org.majhrs16.limiter;
 
 import android.Manifest;
 import android.annotation.SuppressLint;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ApplicationInfo;
@@ -41,6 +43,7 @@ import androidx.core.content.ContextCompat;
 import androidx.core.view.GravityCompat;
 import androidx.drawerlayout.widget.DrawerLayout;
 
+import org.majhrs16.limiter.core.Diag;
 import org.majhrs16.limiter.core.Format;
 import org.majhrs16.limiter.core.Stats;
 import org.majhrs16.limiter.core.VpnConfig;
@@ -60,12 +63,14 @@ public class MainActivity extends AppCompatActivity {
 	private static final int SEEK_MAX = 1000;
 	private static final int PAGE_MAIN = 0;
 	private static final int PAGE_SPLIT = 1;
+	private static final int PAGE_LOGS = 2;
 
 	private DrawerLayout drawer;
 	private ViewFlipper pages;
 	private TextView topTitle;
 	private TextView navMain;
 	private TextView navSplit;
+	private TextView navLogs;
 
 	private SeekBar downSeek;
 	private SeekBar upSeek;
@@ -96,6 +101,14 @@ public class MainActivity extends AppCompatActivity {
 	private AppListAdapter splitAdapter;
 	private boolean appsLoaded;
 
+	private ListView logsList;
+	private TextView logsEmpty;
+	private TextView logsFooter;
+	private CheckBox logsPacketTrace;
+	private CheckBox logsAutoscroll;
+	private LogAdapter logsAdapter;
+	private long logsVersion = -1;
+
 	private VpnConfig config;
 	private final Handler handler = new Handler(Looper.getMainLooper());
 	private boolean ignoreSeekEvents;
@@ -105,8 +118,10 @@ public class MainActivity extends AppCompatActivity {
 	private final ActivityResultLauncher<Intent> vpnLauncher = registerForActivityResult(
 			new ActivityResultContracts.StartActivityForResult(), result -> {
 				if (result.getResultCode() == RESULT_OK) {
+					Diag.i("MainActivity", "Permiso VPN concedido");
 					launchService(LimiterVpnService.ACTION_START);
 				} else {
+					Diag.w("MainActivity", "Permiso VPN denegado", null);
 					Toast.makeText(this, R.string.vpn_permission_denied, Toast.LENGTH_LONG).show();
 				}
 			});
@@ -132,11 +147,13 @@ public class MainActivity extends AppCompatActivity {
 		topTitle = findViewById(R.id.top_title);
 		navMain = findViewById(R.id.nav_main);
 		navSplit = findViewById(R.id.nav_split);
+		navLogs = findViewById(R.id.nav_logs);
 
 		ImageButton menu = findViewById(R.id.menu_button);
 		menu.setOnClickListener(v -> drawer.openDrawer(GravityCompat.START));
 		navMain.setOnClickListener(v -> showPage(PAGE_MAIN));
 		navSplit.setOnClickListener(v -> showPage(PAGE_SPLIT));
+		navLogs.setOnClickListener(v -> showPage(PAGE_LOGS));
 
 		downSeek = findViewById(R.id.down_seek);
 		upSeek = findViewById(R.id.up_seek);
@@ -164,6 +181,12 @@ public class MainActivity extends AppCompatActivity {
 		splitCount = findViewById(R.id.split_count);
 		splitNote = findViewById(R.id.split_note);
 		splitList = findViewById(R.id.split_list);
+
+		logsList = findViewById(R.id.logs_list);
+		logsEmpty = findViewById(R.id.logs_empty);
+		logsFooter = findViewById(R.id.logs_footer);
+		logsPacketTrace = findViewById(R.id.logs_packet_trace);
+		logsAutoscroll = findViewById(R.id.logs_autoscroll);
 
 		config = VpnConfig.load(this);
 
@@ -206,6 +229,7 @@ public class MainActivity extends AppCompatActivity {
 		findViewById(R.id.battery).setOnClickListener(v -> openBatterySettings());
 
 		setupSplitTunnel();
+		setupLogs();
 
 		getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
 			@Override
@@ -299,6 +323,77 @@ public class MainActivity extends AppCompatActivity {
 		updateSplitCount();
 	}
 
+	private void setupLogs() {
+		logsAdapter = new LogAdapter(this);
+		logsList.setAdapter(logsAdapter);
+
+		logsPacketTrace.setChecked(Diag.isPacketTrace());
+		logsPacketTrace.setOnCheckedChangeListener((buttonView, isChecked) -> {
+			Diag.setPacketTrace(isChecked);
+			Diag.i("MainActivity", isChecked
+					? "Trazado de paquetes activado"
+					: "Trazado de paquetes desactivado");
+		});
+		logsAutoscroll.setChecked(true);
+
+		findViewById(R.id.logs_clear).setOnClickListener(v -> {
+			Diag.clear();
+			logsVersion = -1;
+			refreshLogs(true);
+			Toast.makeText(this, R.string.logs_cleared, Toast.LENGTH_SHORT).show();
+		});
+
+		findViewById(R.id.logs_copy).setOnClickListener(v -> copyLogs());
+		updateLogsSubtitle();
+	}
+
+	private void updateLogsSubtitle() {
+		TextView subtitle = findViewById(R.id.logs_subtitle);
+		subtitle.setText(getString(R.string.logs_subtitle, Diag.capacity()));
+	}
+
+	private void copyLogs() {
+		StringBuilder out = new StringBuilder();
+		for (Diag.Entry entry : Diag.snapshot()) {
+			out.append(entry.line()).append('\n');
+		}
+		if (out.length() == 0) {
+			Toast.makeText(this, R.string.logs_empty, Toast.LENGTH_SHORT).show();
+			return;
+		}
+		ClipboardManager clipboard =
+				(ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+		if (clipboard != null) {
+			clipboard.setPrimaryClip(ClipData.newPlainText(
+					getString(R.string.app_name), out.toString()));
+			Toast.makeText(this, R.string.logs_copied, Toast.LENGTH_SHORT).show();
+		}
+	}
+
+	private void refreshLogs(boolean force) {
+		if (logsAdapter == null) {
+			return;
+		}
+		long current = Diag.version();
+		if (!force && current == logsVersion) {
+			return;
+		}
+		logsVersion = current;
+		List<Diag.Entry> entries = Diag.snapshot();
+		logsAdapter.setEntries(entries);
+		boolean empty = entries.isEmpty();
+		logsEmpty.setVisibility(empty ? View.VISIBLE : View.GONE);
+		logsList.setVisibility(empty ? View.GONE : View.VISIBLE);
+		logsFooter.setText(getString(R.string.logs_footer, entries.size(), Diag.dropped()));
+		if (!empty && logsAutoscroll.isChecked()) {
+			logsList.post(() -> {
+				if (logsAdapter.getCount() > 0 && logsAutoscroll.isChecked()) {
+					logsList.setSelection(logsAdapter.getCount() - 1);
+				}
+			});
+		}
+	}
+
 	@Override
 	protected void onResume() {
 		super.onResume();
@@ -306,6 +401,9 @@ public class MainActivity extends AppCompatActivity {
 		syncPageUi(page);
 		if (page == PAGE_SPLIT && !appsLoaded) {
 			loadApps();
+		}
+		if (page == PAGE_LOGS) {
+			refreshLogs(true);
 		}
 		handler.post(poller);
 	}
@@ -323,14 +421,26 @@ public class MainActivity extends AppCompatActivity {
 		if (page == PAGE_SPLIT && !appsLoaded) {
 			loadApps();
 		}
+		if (page == PAGE_LOGS) {
+			refreshLogs(true);
+		}
 	}
 
 	private void syncPageUi(int page) {
-		topTitle.setText(page == PAGE_SPLIT ? R.string.split_title : R.string.app_name);
+		int title;
+		if (page == PAGE_SPLIT) {
+			title = R.string.split_title;
+		} else if (page == PAGE_LOGS) {
+			title = R.string.logs_title;
+		} else {
+			title = R.string.app_name;
+		}
+		topTitle.setText(title);
 		int accent = ContextCompat.getColor(this, R.color.accent);
 		int text = ContextCompat.getColor(this, R.color.text);
 		navMain.setTextColor(page == PAGE_MAIN ? accent : text);
 		navSplit.setTextColor(page == PAGE_SPLIT ? accent : text);
+		navLogs.setTextColor(page == PAGE_LOGS ? accent : text);
 	}
 
 	private void loadApps() {
@@ -384,6 +494,8 @@ public class MainActivity extends AppCompatActivity {
 
 	private void applySplitTunnel() {
 		config.save(this);
+		Diag.i("MainActivity", "Split tunneling guardado: modo=" + config.splitMode
+				+ ", apps=" + config.splitPackages.size());
 		if (LimiterVpnService.isRunning()) {
 			launchService(LimiterVpnService.ACTION_RESTART);
 			Toast.makeText(this, R.string.split_saved_restart, Toast.LENGTH_SHORT).show();
@@ -394,9 +506,11 @@ public class MainActivity extends AppCompatActivity {
 
 	private void onToggle() {
 		if (LimiterVpnService.isRunning()) {
+			Diag.i("MainActivity", "Botón VPN: detener");
 			launchService(LimiterVpnService.ACTION_STOP);
 			return;
 		}
+		Diag.i("MainActivity", "Botón VPN: iniciar");
 		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
 				&& checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
 				!= PackageManager.PERMISSION_GRANTED) {
@@ -409,6 +523,7 @@ public class MainActivity extends AppCompatActivity {
 	private void startVpn() {
 		Intent prepare = VpnService.prepare(this);
 		if (prepare != null) {
+			Diag.i("MainActivity", "Solicitando permiso VPN");
 			vpnLauncher.launch(prepare);
 		} else {
 			launchService(LimiterVpnService.ACTION_START);
@@ -416,6 +531,7 @@ public class MainActivity extends AppCompatActivity {
 	}
 
 	private void launchService(String action) {
+		Diag.i("MainActivity", "Enviando acción al servicio: " + action);
 		Intent intent = new Intent(this, LimiterVpnService.class).setAction(action);
 		if (LimiterVpnService.ACTION_START.equals(action)) {
 			ContextCompat.startForegroundService(this, intent);
@@ -429,6 +545,9 @@ public class MainActivity extends AppCompatActivity {
 		config.upKbps = progressToKbps(upSeek.getProgress());
 		config.rttMs = VpnConfig.MIN_RTT_MS + rttSeek.getProgress();
 		config.save(this);
+		Diag.i("MainActivity", "Límites guardados: up=" + config.upKbps
+				+ " kbps, down=" + config.downKbps + " kbps, rtt=" + config.rttMs
+				+ " ms");
 		if (LimiterVpnService.isRunning()) {
 			launchService(LimiterVpnService.ACTION_UPDATE);
 		}
@@ -481,6 +600,10 @@ public class MainActivity extends AppCompatActivity {
 		long dropsCount = snapshot.aqmDrops;
 		drops.setText(getResources().getQuantityString(R.plurals.drops_value,
 				(int) Math.min(Integer.MAX_VALUE, dropsCount), dropsCount));
+
+		if (pages.getDisplayedChild() == PAGE_LOGS) {
+			refreshLogs(false);
+		}
 	}
 
 	@SuppressLint("BatteryLife")
@@ -627,6 +750,70 @@ public class MainActivity extends AppCompatActivity {
 			label.setText(entry.label);
 			pkg.setText(entry.pkg);
 			check.setChecked(selected.contains(entry.pkg));
+			return view;
+		}
+	}
+
+	private static final class LogAdapter extends BaseAdapter {
+		private final LayoutInflater inflater;
+		private final int textColor;
+		private final int mutedColor;
+		private final int accentColor;
+		private final int dangerColor;
+		private final List<Diag.Entry> entries = new ArrayList<>();
+
+		LogAdapter(Context context) {
+			this.inflater = LayoutInflater.from(context);
+			this.textColor = ContextCompat.getColor(context, R.color.text);
+			this.mutedColor = ContextCompat.getColor(context, R.color.muted);
+			this.accentColor = ContextCompat.getColor(context, R.color.accent);
+			this.dangerColor = ContextCompat.getColor(context, R.color.danger);
+		}
+
+		void setEntries(List<Diag.Entry> next) {
+			entries.clear();
+			entries.addAll(next);
+			notifyDataSetChanged();
+		}
+
+		@Override
+		public int getCount() {
+			return entries.size();
+		}
+
+		@Override
+		public Diag.Entry getItem(int position) {
+			return entries.get(position);
+		}
+
+		@Override
+		public long getItemId(int position) {
+			return position;
+		}
+
+		@Override
+		public View getView(int position, View convertView, ViewGroup parent) {
+			View view = convertView;
+			if (view == null) {
+				view = inflater.inflate(R.layout.item_log, parent, false);
+			}
+			Diag.Entry entry = getItem(position);
+			TextView line = view.findViewById(R.id.log_text);
+			line.setText(entry.line());
+			switch (entry.level) {
+				case 'E':
+					line.setTextColor(dangerColor);
+					break;
+				case 'W':
+					line.setTextColor(accentColor);
+					break;
+				case 'I':
+					line.setTextColor(textColor);
+					break;
+				default:
+					line.setTextColor(mutedColor);
+					break;
+			}
 			return view;
 		}
 	}

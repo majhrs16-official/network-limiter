@@ -8,8 +8,12 @@ configura `chococrispy`. Todo en **Java**, sin Kotlin ni código nativo.
 - Pila TCP/UDP en espacio de usuario (handshake, ventanas, RTO, fast retransmit).
 - Dos colas Cake independientes: subida y bajada.
 - RTT de referencia configurable (5–1000 ms) para el AQM Cobalt.
+- ICMP echo reenviado al destino real con una sonda sin privilegios; nunca se
+  inventa una respuesta local.
 - *Split tunneling* por app: todas, solo seleccionadas o todas menos las
   seleccionadas, desde un menú lateral.
+- Pestaña **Registros** con búfer circular de todos los niveles (incluido
+  debug), sin necesidad de adb.
 - Notificación en primer plano permanente + `PARTIAL_WAKE_LOCK` para que el
   servicio no se duerma.
 - UI AppCompat oscura con sliders logarítmicos (64 kbps – 100 Mbps), presets y
@@ -42,9 +46,12 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 4. Abre el menú lateral (☰) y entra en **Split tunneling** para elegir qué apps
    pasan por la VPN. Pulsa **Aplicar cambios**: si el túnel está activo se
    reinicia para reconstruir la interfaz TUN con la nueva lista.
-5. Pulsa **Evitar la suspensión** y concede la exención de batería para que el
+5. En el menú lateral, abre **Registros** para ver la actividad del motor y de
+   la VPN. Puedes activar el trazado paquete a paquete, limpiar el búfer o
+   copiar todo al portapapeles. Los mensajes de nivel debug también se guardan.
+6. Pulsa **Evitar la suspensión** y concede la exención de batería para que el
    sistema no mate el servicio en segundo plano.
-6. La notificación permanente muestra las tasas y permite detener la VPN.
+7. La notificación permanente muestra las tasas y permite detener la VPN.
 
 > El wake lock y la VPN activa consumen batería de forma continua; es el precio
 > de mantener el túnel y el shaper funcionando sin que Android duerma el proceso.
@@ -79,8 +86,9 @@ app ofrece los tres modos habituales:
 
 Las pruebas JVM cubren checksums y paquetes IPv4/IPv6/TCP/UDP, ICMP,
 fragmentación, aritmética de secuencias, handshake TCP, NAT UDP, Cake (ritmo,
-DRR++, Cobalt, buffer), la caché de `rec_inv_sqrt` bit a bit y la configuración
-de split tunneling.
+DRR++, Cobalt, buffer), la caché de `rec_inv_sqrt` bit a bit, la configuración
+de split tunneling y el reenviador ICMP (éxito, fallo y paquetes que no son
+echo request).
 
 La verificación de compilación es `./gradlew assembleDebug`. No hay
 dispositivo/emulador en este entorno, así que la validación en runtime
@@ -90,10 +98,12 @@ dispositivo/emulador en este entorno, así que la validación en runtime
 
 ```text
 app/src/main/java/org/majhrs16/limiter/
-├── MainActivity.java          UI, drawer, sliders y selector de apps
+├── MainActivity.java          UI, drawer, sliders, selector de apps y registros
 ├── LimiterVpnService.java     VpnService + split + notificación + wake lock
+├── AndroidIcmpProbe.java      Sonda ICMP real (socket sin privilegios)
 └── core/
     ├── VpnConfig.java         Preferencias: ritmos, RTT, MTU y split
+    ├── Diag.java              Búfer circular de logs + espejo a Logcat
     ├── TunnelEngine.java      TUN, selector, pila TCP/UDP, shapers
     ├── net/                   IPv4/IPv6, TCP, UDP, ICMP, checksums
     ├── tcp/                   conexión TCP terminada en usuarios
@@ -106,7 +116,13 @@ app/src/main/java/org/majhrs16/limiter/
 - Sin reensamblado de fragmentos IP; sin SACK, timestamps ni ECN.
 - La subida no aplica caídas AQM (los datos ya se confirmaron al dispositivo);
   la latencia se acota con la ventana y el presupuesto de cola.
-- ICMP echo se responde localmente; multicast/broadcast/link-local se filtran.
+- ICMP echo se reenvía al destino con un socket ICMP sin privilegios. Si el
+  kernel no lo permite, se usa `InetAddress.isReachable()`; si ninguna sonda
+  funciona, no se responde. Multicast/broadcast/link-local se filtran.
+- Solo se anuncia `::/0` cuando la red subyacente tiene una dirección IPv6
+  global y una ruta por defecto IPv6. Los DNS IPv6 se omiten en redes
+  IPv4-only y, si no hay ningún DNS IPv4, se añaden `1.1.1.1` y `8.8.8.8` como
+  respaldo.
 - El split tunneling se aplica al arrancar el túnel: cambiarlo con la VPN
   activa provoca un reinicio breve del servicio.
 - La lista de apps se carga en el hilo principal al abrir la página por primera

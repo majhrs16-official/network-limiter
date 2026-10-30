@@ -4,7 +4,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
-/** Respuestas ICMP locales (echo) y errores de tamaño para IPv6. */
+/**
+ * Utilidades ICMP: construcción de la respuesta a un echo request ya
+ * confirmado por una sonda real, errores de tamaño para IPv6 y fragmentación
+ * IPv4.
+ */
 public final class Icmp {
 
 	private Icmp() {
@@ -24,8 +28,9 @@ public final class Icmp {
 	}
 
 	/**
-	 * Construye la respuesta a un echo request. La respuesta se genera
-	 * localmente (el TUN no tiene un peer ICMP real).
+	 * Construye la respuesta a un echo request. Solo debe llamarse después de
+	 * que una sonda real ({@code IcmpProbe}) haya confirmado que el destino
+	 * responde; el TUN no tiene un peer ICMP propio.
 	 */
 	public static byte[] buildEchoReply(IpPacket ip) {
 		if (!isEchoRequest(ip)) {

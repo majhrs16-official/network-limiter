@@ -23,6 +23,7 @@ referencia (`rtt`) que alimenta el AQM Cobalt.
                  +---------------------------------------------+
  App Android     |              LimiterVpnService              |
                  |  VpnService.Builder: 10.111.0.1/32, ::/0    |
+                 |  (::/0 solo si la red subyacente tiene IPv6)|
                  +----------------------+----------------------+
                                         | ParcelFileDescriptor (TUN)
                         +---------------v----------------+
@@ -34,7 +35,7 @@ referencia (`rtt`) que alimenta el AQM Cobalt.
                     upShaper (Cake)         downShaper (Cake)
                              |                      |
                  SocketChannel saliente      escritura al TUN
-                 (protect() obligatorio)
+                 (protect() best-effort; app excluida)
 ```
 
 ### Hilos
@@ -55,7 +56,11 @@ No hay un hilo por conexión: un `Selector` multiplexa todos los sockets.
 - IPv6: cabecera fija + extensión (hop-by-hop, routing, destination options);
   descarte de fragmentos.
 - Construcción de paquetes IPv4/IPv6 con checksum correcto.
-- ICMP echo (v4/v6) respondido localmente para diagnóstico.
+- ICMP echo (v4/v6) se reenvía al destino real con un socket ICMP sin
+  privilegios (`SOCK_DGRAM` + `IPPROTO_ICMP`/`IPPROTO_ICMPV6`). Solo se
+  construye la respuesta si la sonda recibió un echo reply real; si el kernel
+  no permite el socket, se usa `InetAddress.isReachable()`. Nunca se responde
+  localmente con una latencia falsa.
 - UDP de gran tamaño: fragmentación IPv4 y ICMPv6 *Packet Too Big*.
 
 ### TCP
@@ -76,7 +81,9 @@ CLOSE_WAIT, CLOSING, LAST_ACK, TIME_WAIT):
   `protect()` **antes** de conectar y se registra en el selector.
 
 ### UDP
-- NAT por flujo (5-tupla) con `DatagramChannel` no bloqueante y `protect()`.
+- NAT por flujo (5-tupla) con `DatagramChannel` no bloqueante y `protect()`
+  best-effort. La app está siempre excluida del túnel, así que un `protect()`
+  fallido no cierra el flujo.
 - Timeout de inactividad y reenvío bidireccional.
 
 ## 4. Limitador: CAKE real, no un token bucket genérico
@@ -140,12 +147,20 @@ comportamiento observable:
 ## 5. Servicio y UI
 
 - `LimiterVpnService` en primer plano (`specialUse`), notificación con acción
-  de parada, DNS tomados de la red activa y *fallback* público.
+  de parada, DNS tomados de la red subyacente y *fallback* público.
 - El servicio se declara `exported="true"` pero protegido por
   `BIND_VPN_SERVICE`: es el sistema quien debe poder enlazarlo para
   `onRevoke`, VPN siempre activa y cambios de red subyacente.
-- Los DNS link-local, loopback y multicast de la red activa se omiten: no son
-  enrutables a través del TUN y el motor los filtraría.
+- La red subyacente se identifica explícitamente (se ignora cualquier red con
+  `TRANSPORT_VPN`), de modo que al reiniciar el servicio no se heredan la
+  dirección IPv6 ni los DNS de la VPN anterior.
+- Solo se anuncia `::/0` cuando la red subyacente tiene una dirección IPv6
+  global y una ruta por defecto IPv6; en redes IPv4-only no se blackholea el
+  tráfico IPv6 de las apps.
+- Se prefieren DNS IPv4; los DNS IPv6 se omiten si no hay IPv6 real. Si no se
+  añadió ningún DNS IPv4, se usan `1.1.1.1` y `8.8.8.8` como respaldo.
+- Los DNS link-local, loopback, multicast y los de la propia interfaz TUN se
+  omiten: no son enrutables a través del TUN.
 - **Persistencia en runtime:** notificación permanente e inamovible
   (`setOngoing(true)`, `setOnlyAlertOnce(true)`, categoría `service`,
   `FOREGROUND_SERVICE_IMMEDIATE`) que muestra estado y tasas en vivo, más un
@@ -159,9 +174,13 @@ comportamiento observable:
 - **RTT configurable:** slider de 5–1000 ms (80 ms por defecto) que se guarda
   en `SharedPreferences` y se envía al motor con `ACTION_UPDATE`. Al cambiar el
   RTT se recalculan `target`, `interval` y el límite de buffer de Cake.
-- **Navegación:** `DrawerLayout` con botón hamburguesa y `ViewFlipper` de dos
-  páginas: «Límites y tráfico» y «Split tunneling». El botón atrás cierra el
-  drawer o vuelve a la página principal.
+- **Navegación:** `DrawerLayout` con botón hamburguesa y `ViewFlipper` de tres
+  páginas: «Límites y tráfico», «Split tunneling» y «Registros». El botón atrás
+  cierra el drawer o vuelve a la página principal.
+- **Registros:** búfer circular `Diag` de 3000 entradas que conserva todos los
+  niveles (incluido debug) y se replica a Logcat si el servicio está activo.
+  La pestaña permite activar el trazado paquete a paquete, limpiar, copiar al
+  portapapeles y hacer auto-scroll. No requiere adb.
 - **Split tunneling:** lista de apps instaladas con búsqueda, filtro de apps
   del sistema y selección múltiple. Modos: todas, solo seleccionadas y todas
   excepto las seleccionadas. La app propia se excluye siempre. Android no
@@ -176,7 +195,7 @@ comportamiento observable:
 
 ## 6. Pruebas
 
-- 31 pruebas unitarias JVM (`./gradlew testDebugUnitTest`):
+- 34 pruebas unitarias JVM (`./gradlew testDebugUnitTest`):
   - `PacketTest`: checksums, parseo/construcción IPv4/IPv6/TCP/UDP, ICMP,
     fragmentación.
   - `SequenceTest`: aritmética modular de secuencias.
@@ -184,15 +203,19 @@ comportamiento observable:
   - `CakeQueueTest`: ritmo, DRR++, prioridad de flujos nuevos, AQM, buffer,
     poda de la cola más larga con muchos flujos y cambio de ritmo con reloj
     inyectado.
+  - `IcmpForwarderTest`: una sonda exitosa construye un echo reply real, una
+    sonda fallida no inventa respuesta y los paquetes que no son echo request
+    se ignoran.
   - `TcpConnectionTest`: handshake completo, dirección de SYN-ACK y ACK.
   - `UdpFlowTest`: NAT de subida/bajada, puertos y checksum.
   - `VpnConfigTest`: límites de ritmo/RTT, modos de split y copia profunda de
     la selección de apps.
 - `./gradlew assembleDebug` como verificación de compilación.
 - `./gradlew lintDebug` con 0 errores.
-- Prueba manual en dispositivo: handshake, HTTP/HTTPS, DNS, IPv6, ping,
-  límite efectivo con `speedtest`/`curl`, revocación del permiso VPN, cambio de
-  RTT en caliente y split tunneling en los tres modos.
+- Prueba manual en dispositivo: handshake, HTTP/HTTPS, DNS, IPv6, ping con RTT
+  real (no ~1 ms), límite efectivo con `speedtest`/`curl`, revocación del
+  permiso VPN, cambio de RTT en caliente, split tunneling en los tres modos y
+  pestaña de registros sin adb.
 
 ## 7. Limitaciones conocidas
 
@@ -212,7 +235,11 @@ comportamiento observable:
   pero Google Play restringe su uso.
 - Se filtran multicast, broadcast y link-local (mDNS, SSDP, DHCP, ND): no
   tienen sentido a través del túnel.
-- ICMP echo se responde localmente (no viaja a Internet).
+- ICMP echo se reenvía al destino con un socket sin privilegios. Si el kernel
+  no permite ese socket, se usa `InetAddress.isReachable()`; si ninguna sonda
+  funciona, el ping no recibe respuesta (no se simula una latencia local).
+- En redes IPv4-only no se anuncia `::/0` ni se usan DNS IPv6; si no hay DNS
+  IPv4 se añaden resolvers públicos.
 
 ## 8. Estructura
 
@@ -220,16 +247,17 @@ comportamiento observable:
 app/src/main/java/org/majhrs16/limiter/
 ├── MainActivity.java
 ├── LimiterVpnService.java
+├── AndroidIcmpProbe.java
 └── core/
     ├── VpnConfig.java · Stats.java · Diag.java · Format.java
     ├── TunnelEngine.java
-    ├── net/  IpPacket · TcpSegment · UdpDatagram · Icmp · Checksum · FlowKey · HostKey · Delivery
+    ├── net/  IpPacket · TcpSegment · UdpDatagram · Icmp · IcmpProbe · IcmpForwarder · Checksum · FlowKey · HostKey · Delivery
     ├── tcp/  TcpConnection · TcpCallbacks
     ├── udp/  UdpFlow
     └── shaper/ CakeQueue · CakeShaper · Cobalt
 app/src/test/java/org/majhrs16/limiter/core/
 ├── VpnConfigTest.java
-├── net/PacketTest.java
+├── net/PacketTest.java · IcmpForwarderTest.java
 ├── shaper/CobaltTest.java · CakeQueueTest.java
 ├── tcp/SequenceTest.java · TcpConnectionTest.java
 └── udp/UdpFlowTest.java

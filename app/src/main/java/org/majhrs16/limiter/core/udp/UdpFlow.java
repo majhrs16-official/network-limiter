@@ -1,5 +1,6 @@
 package org.majhrs16.limiter.core.udp;
 
+import org.majhrs16.limiter.core.Diag;
 import org.majhrs16.limiter.core.Stats;
 import org.majhrs16.limiter.core.net.Delivery;
 import org.majhrs16.limiter.core.net.FlowKey;
@@ -46,6 +47,7 @@ public final class UdpFlow {
 	private static final long IDLE_TIMEOUT = 60_000_000_000L;
 	private static final int MAX_OUTBOUND_BYTES = 64 * 1024;
 	private static final AtomicInteger IP_ID = new AtomicInteger(1);
+	private static final String TAG = "UdpFlow";
 
 	private final Callbacks cb;
 	private final FlowKey key;
@@ -115,8 +117,13 @@ public final class UdpFlow {
 						cb.enqueueDownload(fragment, downloadKey, NOOP);
 					}
 				}
+				if (key.dstPort == 53) {
+					Diag.i(TAG, "DNS respuesta de " + address(key.dstIp)
+							+ " (" + read + " bytes)");
+				}
 			}
-		} catch (IOException e) {
+		} catch (Throwable error) {
+			Diag.w(TAG, "Lectura UDP falló para " + key, error);
 			close(now);
 			return;
 		}
@@ -147,7 +154,8 @@ public final class UdpFlow {
 					outboundBytes.addAndGet(-data.length);
 				}
 			}
-		} catch (IOException e) {
+		} catch (Throwable error) {
+			Diag.w(TAG, "Escritura UDP falló para " + key, error);
 			close(now);
 			return;
 		}
@@ -159,6 +167,9 @@ public final class UdpFlow {
 		if (outboundBytes.addAndGet(data.length) > MAX_OUTBOUND_BYTES) {
 			outboundBytes.addAndGet(-data.length);
 			cb.stats().dropped.incrementAndGet();
+			if (Diag.isPacketTrace()) {
+				Diag.d(TAG, "Cola UDP llena; se descarta " + key);
+			}
 			return;
 		}
 		outbound.add(data);
@@ -198,6 +209,15 @@ public final class UdpFlow {
 		} catch (IOException ignored) {
 			/* nada */
 		}
+		Diag.d(TAG, "Flujo UDP cerrado " + key);
 		cb.onFlowClosed(this);
+	}
+
+	private static String address(byte[] raw) {
+		try {
+			return java.net.InetAddress.getByAddress(raw).getHostAddress();
+		} catch (Throwable ignored) {
+			return "?";
+		}
 	}
 }

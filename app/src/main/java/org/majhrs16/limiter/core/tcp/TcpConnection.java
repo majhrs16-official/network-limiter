@@ -194,10 +194,18 @@ public final class TcpConnection {
 				/* algunos proveedores no exponen el adaptador */
 			}
 
-			if (!cb.protect(channel)) {
-				Diag.w(TAG, "protect() rechazó el socket; se cierra " + key);
-				close(true, now);
-				return;
+			boolean protectedSocket = false;
+			try {
+				protectedSocket = cb.protect(channel);
+			} catch (Throwable error) {
+				Diag.w(TAG, "protect() lanzó para " + key, error);
+			}
+			if (!protectedSocket) {
+				/* La app está excluida de la VPN, así que el socket ya sale
+				 * por la red subyacente. No se cierra por un protect()
+				 * fallido. */
+				Diag.w(TAG, "protect() devolvió false para " + key
+						+ "; se continúa");
 			}
 
 			/* Buffers del socket acotados al BDP: evita que el kernel
@@ -216,8 +224,9 @@ public final class TcpConnection {
 				connected = true;
 				connecting = false;
 				flushPendingUp();
+				Diag.d(TAG, "TCP conectado " + key);
 			}
-		} catch (Exception e) {
+		} catch (Throwable e) {
 			Diag.w(TAG, "No se pudo conectar a " + key, e);
 			close(true, now);
 		}
@@ -233,8 +242,9 @@ public final class TcpConnection {
 				connecting = false;
 				flushPendingUp();
 				updateInterest();
+				Diag.d(TAG, "TCP conectado " + key);
 			}
-		} catch (IOException e) {
+		} catch (Throwable e) {
 			Diag.w(TAG, "connect() falló para " + key, e);
 			close(true, now);
 		}
@@ -271,7 +281,8 @@ public final class TcpConnection {
 					break;
 				}
 			}
-		} catch (IOException e) {
+		} catch (Throwable error) {
+			Diag.w(TAG, "Lectura TCP falló; se cierra " + key, error);
 			close(true, now);
 			return;
 		}
@@ -318,7 +329,8 @@ public final class TcpConnection {
 
 			tryShutdownOutput();
 			maybeWindowUpdate(now);
-		} catch (IOException e) {
+		} catch (Throwable error) {
+			Diag.w(TAG, "Escritura TCP falló; se cierra " + key, error);
 			close(true, now);
 			return;
 		}
@@ -339,6 +351,7 @@ public final class TcpConnection {
 		}
 
 		if (segment.has(TcpSegment.RST)) {
+			Diag.d(TAG, "TCP RST recibido " + key);
 			close(false, now);
 			return;
 		}
@@ -368,6 +381,7 @@ public final class TcpConnection {
 		if (state == SYN_RECEIVED) {
 			if (segment.ack == add(iss, 1)) {
 				state = ESTABLISHED;
+				Diag.d(TAG, "TCP establecido " + key);
 				flushPendingUp();
 				updateInterest();
 			} else {
@@ -449,6 +463,7 @@ public final class TcpConnection {
 	 */
 	public void onUploadDropped(int bytes) {
 		pendingUpBytes = Math.max(0, pendingUpBytes - bytes);
+		Diag.w(TAG, "Shaper descartó " + bytes + " bytes de subida para " + key);
 	}
 
 	public void updateInterest() {
@@ -483,6 +498,7 @@ public final class TcpConnection {
 		}
 		closed = true;
 		state = CLOSED;
+		Diag.d(TAG, "TCP cerrado " + key + (rst ? " (RST)" : ""));
 		SelectionKey k = selection;
 		if (k != null) {
 			k.cancel();
@@ -504,6 +520,8 @@ public final class TcpConnection {
 				iss, rcvNxt, TcpSegment.SYN | TcpSegment.ACK,
 				(int) Math.min(65535, rcvWnd()), null, 0, 0,
 				ourMss, windowScaling ? rcvScale : -1, false);
+		Diag.d(TAG, "SYN-ACK " + key + " mss=" + ourMss
+				+ " scale=" + (windowScaling ? rcvScale : -1));
 		Segment segment = new Segment(iss, 1, packet, true, false);
 		unacked.put(iss, segment);
 		enqueue(segment, now);

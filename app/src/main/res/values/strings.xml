@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<resources>
+<resources xmlns:tools="http://schemas.android.com/tools">
 	<string name="app_name">Network Limiter</string>
 	<string name="subtitle">VPN local con control de ancho de banda estilo CAKE</string>
 
@@ -24,6 +24,7 @@
 	<string name="nav_section">Navegación</string>
 	<string name="nav_main">Límites y tráfico</string>
 	<string name="nav_split">Split tunneling</string>
+	<string name="nav_logs">Registros</string>
 	<string name="drawer_subtitle">VPN local · CAKE</string>
 	<string name="drawer_footer">GPL-3.0 · v1.0</string>
 
@@ -45,6 +46,17 @@
 	<string name="split_apply">Aplicar cambios</string>
 	<string name="split_saved">Configuración de split tunneling guardada</string>
 	<string name="split_saved_restart">Guardado. Reiniciando la VPN…</string>
+
+	<string name="logs_title">Registros</string>
+	<string name="logs_subtitle" tools:ignore="PluralsCandidate">Actividad del motor y de la VPN. Se conservan los últimos %1$d mensajes, incluidos los de nivel debug.</string>
+	<string name="logs_packet_trace">Registrar cada paquete</string>
+	<string name="logs_autoscroll">Auto-scroll</string>
+	<string name="logs_clear">Limpiar</string>
+	<string name="logs_copy">Copiar</string>
+	<string name="logs_empty">Sin registros todavía. Activa la VPN y usa la red para generar actividad.</string>
+	<string name="logs_footer" tools:ignore="PluralsCandidate">%1$d entradas · %2$d descartadas por límite de búfer</string>
+	<string name="logs_copied">Registros copiados al portapapeles</string>
+	<string name="logs_cleared">Registros borrados</string>
 
 	<string name="traffic_title">Tráfico</string>
 	<string name="down_now">Bajada actual</string>
