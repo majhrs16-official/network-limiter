@@ -302,6 +302,11 @@ public class MainActivity extends AppCompatActivity {
 	@Override
 	protected void onResume() {
 		super.onResume();
+		int page = pages.getDisplayedChild();
+		syncPageUi(page);
+		if (page == PAGE_SPLIT && !appsLoaded) {
+			loadApps();
+		}
 		handler.post(poller);
 	}
 
@@ -313,15 +318,19 @@ public class MainActivity extends AppCompatActivity {
 
 	private void showPage(int page) {
 		pages.setDisplayedChild(page);
+		syncPageUi(page);
+		drawer.closeDrawer(GravityCompat.START);
+		if (page == PAGE_SPLIT && !appsLoaded) {
+			loadApps();
+		}
+	}
+
+	private void syncPageUi(int page) {
 		topTitle.setText(page == PAGE_SPLIT ? R.string.split_title : R.string.app_name);
 		int accent = ContextCompat.getColor(this, R.color.accent);
 		int text = ContextCompat.getColor(this, R.color.text);
 		navMain.setTextColor(page == PAGE_MAIN ? accent : text);
 		navSplit.setTextColor(page == PAGE_SPLIT ? accent : text);
-		drawer.closeDrawer(GravityCompat.START);
-		if (page == PAGE_SPLIT && !appsLoaded) {
-			loadApps();
-		}
 	}
 
 	private void loadApps() {
