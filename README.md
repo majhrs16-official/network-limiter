@@ -84,11 +84,12 @@ app ofrece los tres modos habituales:
 ./gradlew lintDebug
 ```
 
-Las pruebas JVM cubren checksums y paquetes IPv4/IPv6/TCP/UDP, ICMP,
+Las 40 pruebas JVM cubren checksums y paquetes IPv4/IPv6/TCP/UDP, ICMP,
 fragmentación, aritmética de secuencias, handshake TCP, NAT UDP, Cake (ritmo,
-DRR++, Cobalt, buffer), la caché de `rec_inv_sqrt` bit a bit, la configuración
-de split tunneling y el reenviador ICMP (éxito, fallo y paquetes que no son
-echo request).
+DRR++, Cobalt, buffer, transición sparse→bulk sin entradas obsoletas y equidad
+entre flujos), la caché de `rec_inv_sqrt` bit a bit, la configuración de split
+tunneling y el reenviador ICMP (éxito, fallo y paquetes que no son echo
+request).
 
 La verificación de compilación es `./gradlew assembleDebug`. No hay
 dispositivo/emulador en este entorno, así que la validación en runtime
@@ -131,7 +132,14 @@ app/src/main/java/org/majhrs16/limiter/
   checksum TCP/UDP de los paquetes que vienen del kernel local (puede ser
   parcial con GSO); el socket de salida lo recalcula. Sin esto, una descarga o
   subida intensa podía truncar el paquete, matar el lector y dejar la VPN sin
-  rutear.
+  rutear. Los payloads TCP de un GSO/TSO se trocean en segmentos antes del
+  shaper para que el ritmo se aplique de verdad y no se inyecte una ráfaga de
+  decenas de KiB en la red subyacente.
+- Cada flujo vive en una sola lista de planificación. La transición
+  sparse→bulk lo saca de `newFlows` antes de pasarlo a `oldFlows`; una entrada
+  obsoleta al frente de `newFlows` hacía que el shaper seleccionara siempre un
+  flujo vacío y dejaba sin subida a DNS, WhatsApp y al resto de apps, aunque
+  ICMP (un flujo de un solo paquete) siguiera respondiendo.
 - El split tunneling se aplica al arrancar el túnel: cambiarlo con la VPN
   activa provoca un reinicio breve del servicio.
 - La lista de apps se carga en el hilo principal al abrir la página por primera

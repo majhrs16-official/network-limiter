@@ -139,6 +139,119 @@ public class CakeQueueTest {
 	}
 
 	@Test
+	public void flowStaysSchedulableAfterSparseToBulkTransition() {
+		CakeQueue queue = new CakeQueue(1500, 0, 80_000_000L, false);
+		FlowKey first = key(1);
+		for (int i = 0; i < 10; i++) {
+			queue.enqueue(item(first, 1500), 0);
+		}
+
+		int delivered = 0;
+		for (int i = 0; i < 1000 && delivered < 10; i++) {
+			CakeQueue.Poll poll = queue.poll(0);
+			if (poll.item != null) {
+				delivered++;
+			}
+		}
+		assertEquals(10, delivered);
+		assertEquals(0L, queue.backlogBytes());
+
+		/* El flujo anterior ya se vació: no debe quedar una entrada
+		 * obsoleta que impida planificar flujos nuevos. */
+		FlowKey second = key(2);
+		queue.enqueue(item(second, 500), 0);
+		CakeQueue.Poll poll = queue.poll(0);
+		assertNotNull("el shaper quedó atascado en un flujo obsoleto", poll.item);
+		assertEquals(second, poll.item.flow);
+	}
+
+	@Test
+	public void bulkFlowDoesNotStarveNewFlow() {
+		CakeQueue queue = new CakeQueue(1500, 0, 80_000_000L, false);
+		FlowKey bulk = key(1);
+		for (int i = 0; i < 100; i++) {
+			queue.enqueue(item(bulk, 1500), 0);
+		}
+		FlowKey fresh = key(2);
+		queue.enqueue(item(fresh, 500), 0);
+
+		boolean delivered = false;
+		int polls = 0;
+		for (int i = 0; i < 100; i++) {
+			CakeQueue.Poll poll = queue.poll(0);
+			polls++;
+			if (poll.item != null && fresh.equals(poll.item.flow)) {
+				delivered = true;
+				break;
+			}
+		}
+		assertTrue("el flujo nuevo no recibió servicio", delivered);
+		assertTrue("el flujo nuevo esperó " + polls + " turnos", polls <= 5);
+	}
+
+	@Test
+	public void recentlyActiveDecayingFlowDoesNotBlockNewFlow() {
+		CakeQueue queue = new CakeQueue(1500, 0, 1_000_000_000L, true);
+		FlowKey first = key(1);
+		queue.enqueue(item(first, 500), 0);
+		CakeQueue.Poll firstPoll = queue.poll(0);
+		assertNotNull(firstPoll.item);
+		assertEquals(first, firstPoll.item.flow);
+
+		/* El flujo acaba de vaciarse y conserva un dropNext en el futuro.
+		 * No debe ser seleccionado mientras no tenga paquetes. */
+		FlowKey second = key(2);
+		queue.enqueue(item(second, 500), 0);
+		CakeQueue.Poll secondPoll = queue.poll(0);
+		assertNotNull("el flujo en decaying bloqueó al flujo nuevo", secondPoll.item);
+		assertEquals(second, secondPoll.item.flow);
+	}
+
+	@Test
+	public void decayingFlowDoesNotStarveNewFlow() {
+		CakeQueue queue = new CakeQueue(1500, 1_000_000, 80_000_000L, true);
+		FlowKey first = key(1);
+		int packets = 400;
+		for (int i = 0; i < packets; i++) {
+			queue.enqueue(item(first, 1500), 0);
+		}
+
+		long now = 0;
+		int delivered = 0;
+		for (int i = 0; i < 2_000_000; i++) {
+			if (delivered + queue.aqmDroppedPackets() >= packets) {
+				break;
+			}
+			CakeQueue.Poll poll = queue.poll(now);
+			if (poll.item != null) {
+				delivered++;
+			} else {
+				now += Math.max(1, poll.waitNanos);
+			}
+		}
+		assertEquals(packets, delivered + queue.aqmDroppedPackets());
+		assertTrue("la prueba necesita descartes AQM",
+				queue.aqmDroppedPackets() > 0);
+		assertEquals(0L, queue.backlogBytes());
+
+		/* El flujo vacío conserva estado Cobalt en decaying; no debe
+		 * competir por el shaper ni bloquear a un flujo nuevo. */
+		FlowKey second = key(2);
+		queue.enqueue(item(second, 500), now);
+		long deadline = now + 1_000_000_000L;
+		CakeQueue.Poll poll = null;
+		while (now < deadline) {
+			poll = queue.poll(now);
+			if (poll.item != null) {
+				break;
+			}
+			now += Math.max(1, Math.min(poll.waitNanos, deadline - now));
+		}
+		assertNotNull("el flujo en decaying bloqueó la planificación", poll);
+		assertEquals(second, poll.item.flow);
+	}
+
+	@Test
 	public void rateChangeAppliesToQueuedTraffic() {
 		CakeQueue queue = new CakeQueue(1500, 1_000_000, 80_000_000L, false);
 		FlowKey flow = key(1);

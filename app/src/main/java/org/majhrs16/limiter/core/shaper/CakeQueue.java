@@ -1,10 +1,12 @@
 package org.majhrs16.limiter.core.shaper;
 
+import org.majhrs16.limiter.core.Diag;
 import org.majhrs16.limiter.core.net.FlowKey;
 import org.majhrs16.limiter.core.net.HostKey;
 
 import java.util.ArrayDeque;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.Map;
 import java.util.Random;
 
@@ -198,23 +200,28 @@ public final class CakeQueue {
 		}
 
 		if (flow.set == SET_DECAYING) {
-			decayingFlows.remove(flow);
-			decayingCount--;
+			if (decayingFlows.remove(flow)) {
+				decayingCount = Math.max(0, decayingCount - 1);
+			}
 			flow.set = SET_SPARSE;
 			sparseCount++;
+			newFlows.remove(flow);
 			newFlows.addLast(flow);
 			flow.deficit = initialDeficit(flow);
 		} else if (flow.set == SET_NONE) {
 			flow.set = SET_SPARSE;
 			sparseCount++;
+			newFlows.remove(flow);
 			newFlows.addLast(flow);
 			flow.deficit = initialDeficit(flow);
 		} else if (flow.set == SET_SPARSE_WAIT) {
-			newFlows.remove(flow);
+			if (newFlows.remove(flow)) {
+				sparseCount = Math.max(0, sparseCount - 1);
+			}
 			flow.set = SET_BULK;
-			sparseCount--;
 			bulkCount++;
 			bulkInc(flow);
+			oldFlows.remove(flow);
 			oldFlows.addLast(flow);
 		}
 
@@ -250,9 +257,7 @@ public final class CakeQueue {
 				backlog -= droppedItem.length;
 				dropped++;
 				victim.cobalt.queueFull(params, now);
-				if (droppedItem.onDrop != null) {
-					droppedItem.onDrop.run();
-				}
+				safeDrop(droppedItem);
 				if (victim.queue.isEmpty()) {
 					handleEmpty(victim, now);
 				}
@@ -272,6 +277,9 @@ public final class CakeQueue {
 	 * Devuelve el siguiente paquete o el tiempo que falta para poder enviarlo.
 	 */
 	public synchronized Poll poll(long now) {
+		/* Los flujos en decaying no tienen paquetes: solo conservan estado
+		 * Cobalt. Se podan por tiempo, pero no compiten por el shaper. */
+		pruneDecaying(now);
 		if (backlog == 0) {
 			return new Poll(null, Long.MAX_VALUE);
 		}
@@ -280,10 +288,8 @@ public final class CakeQueue {
 			return new Poll(null, Math.max(1, wait));
 		}
 
-		boolean first = true;
 		for (int guard = 0; guard < 8192; guard++) {
-			Flow flow = pick(first);
-			first = false;
+			Flow flow = pick();
 			if (flow == null) {
 				return new Poll(null, 50_000_000L);
 			}
@@ -294,20 +300,15 @@ public final class CakeQueue {
 			}
 
 			if (flow.deficit <= 0) {
-				if (flow.set == SET_SPARSE) {
-					if (!flow.queue.isEmpty()) {
-						sparseCount--;
-						bulkCount++;
-						bulkInc(flow);
-						flow.set = SET_BULK;
-					} else {
-						flow.set = SET_SPARSE_WAIT;
-					}
-				}
+				/* moveToOld hace la transición sparse -> bulk y saca el
+				 * flujo de newFlows. Si se cambia flow.set antes de llamar
+				 * a moveToOld, el flujo queda en newFlows y oldFlows a la
+				 * vez; al vaciarse deja una entrada obsoleta al frente de
+				 * newFlows y el shaper ya no planifica ningún flujo real. */
+				moveToOld(flow);
 				int hostLoad = hostLoad(flow);
 				flow.deficit += (int) (((long) flowQuantum * QUANTUM_DIV[hostLoad]
 						+ random.nextInt(65536)) >> 16);
-				moveToOld(flow);
 				continue;
 			}
 
@@ -320,9 +321,7 @@ public final class CakeQueue {
 				backlog -= item.length;
 				dropped++;
 				aqmDropped++;
-				if (item.onDrop != null) {
-					item.onDrop.run();
-				}
+				safeDrop(item);
 				continue;
 			}
 
@@ -412,20 +411,41 @@ public final class CakeQueue {
 		return Math.min(CAKE_QUEUES, Math.max(flow.srcHost.srcBulk, flow.dstHost.dstBulk));
 	}
 
-	private Flow pick(boolean first) {
-		if (first && !decayingFlows.isEmpty()) {
-			return decayingFlows.peekFirst();
-		}
+	private Flow pick() {
 		if (!newFlows.isEmpty()) {
 			return newFlows.peekFirst();
 		}
 		if (!oldFlows.isEmpty()) {
 			return oldFlows.peekFirst();
 		}
-		if (!decayingFlows.isEmpty()) {
-			return decayingFlows.peekFirst();
-		}
 		return null;
+	}
+
+	/**
+	 * Un flujo en decaying ya no tiene paquetes. Se conserva su estado Cobalt
+	 * para que un flujo que vuelve a hablar herede la histéresis del AQM, pero
+	 * no se selecciona para enviar. Cuando el estado llega a reposo se libera.
+	 */
+	private void pruneDecaying(long now) {
+		if (decayingFlows.isEmpty()) {
+			return;
+		}
+		Iterator<Flow> iterator = decayingFlows.iterator();
+		while (iterator.hasNext()) {
+			Flow flow = iterator.next();
+			if (!flow.queue.isEmpty()) {
+				/* No debería ocurrir: enqueue lo habría movido a newFlows. */
+				continue;
+			}
+			flow.cobalt.queueEmpty(params, now);
+			if (flow.cobalt.atRest(now)) {
+				iterator.remove();
+				decayingCount = Math.max(0, decayingCount - 1);
+				flows.remove(flow.key);
+				releaseHost(flow.srcHost);
+				releaseHost(flow.dstHost);
+			}
+		}
 	}
 
 	private void handleEmpty(Flow flow, long now) {
@@ -443,43 +463,41 @@ public final class CakeQueue {
 	}
 
 	private void removeFromList(Flow flow) {
-		switch (flow.set) {
-			case SET_SPARSE:
-			case SET_SPARSE_WAIT:
-				newFlows.remove(flow);
-				sparseCount--;
-				break;
-			case SET_BULK:
-				oldFlows.remove(flow);
-				bulkCount--;
-				bulkDec(flow);
-				break;
-			case SET_DECAYING:
-				decayingFlows.remove(flow);
-				decayingCount--;
-				break;
-			default:
-				break;
+		/* Se comprueba la pertenencia real a cada lista, no solo flow.set:
+		 * así una entrada obsoleta nunca sobrevive a un cambio de estado. */
+		if (newFlows.remove(flow)) {
+			sparseCount = Math.max(0, sparseCount - 1);
+		}
+		if (oldFlows.remove(flow)) {
+			bulkCount = Math.max(0, bulkCount - 1);
+			bulkDec(flow);
+		}
+		if (decayingFlows.remove(flow)) {
+			decayingCount = Math.max(0, decayingCount - 1);
 		}
 	}
 
 	private void moveToOld(Flow flow) {
 		if (flow.set == SET_SPARSE || flow.set == SET_SPARSE_WAIT) {
-			newFlows.remove(flow);
-			sparseCount--;
+			if (newFlows.remove(flow)) {
+				sparseCount = Math.max(0, sparseCount - 1);
+			}
 			flow.set = SET_BULK;
 			bulkCount++;
 			bulkInc(flow);
+			oldFlows.remove(flow);
 			oldFlows.addLast(flow);
 		} else if (flow.set == SET_BULK) {
 			oldFlows.remove(flow);
 			oldFlows.addLast(flow);
 		} else if (flow.set == SET_DECAYING) {
-			decayingFlows.remove(flow);
-			decayingCount--;
+			if (decayingFlows.remove(flow)) {
+				decayingCount = Math.max(0, decayingCount - 1);
+			}
 			flow.set = SET_BULK;
 			bulkCount++;
 			bulkInc(flow);
+			oldFlows.remove(flow);
 			oldFlows.addLast(flow);
 		}
 	}
@@ -490,6 +508,21 @@ public final class CakeQueue {
 		flows.remove(flow.key);
 		releaseHost(flow.srcHost);
 		releaseHost(flow.dstHost);
+	}
+
+	/**
+	 * Un callback de descarte no puede romper la contabilidad de la cola ni
+	 * matar al shaper: el paquete ya se descontó antes de invocarlo.
+	 */
+	private static void safeDrop(Item item) {
+		if (item == null || item.onDrop == null) {
+			return;
+		}
+		try {
+			item.onDrop.run();
+		} catch (Throwable error) {
+			Diag.e("CakeQueue", "Callback de descarte falló", error);
+		}
 	}
 
 	private void bulkInc(Flow flow) {

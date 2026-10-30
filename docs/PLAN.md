@@ -71,7 +71,10 @@ deje sin servicio al resto del tráfico:
   compita con el motor.
 - Un watchdog cada 5 s comprueba que el hilo del motor completa iteraciones. Si
   se queda bloqueado, vuelca su pila en la pestaña de registros. También
-  vigila que el lector del TUN y los dos shapers sigan vivos.
+  vigila que el lector del TUN y los dos shapers sigan vivos. Además, cada
+  shaper publica el instante de su última entrega: si hay backlog y no entrega
+  nada en 15 s, `isHealthy()` lo trata como atascado y el servicio reinicia la
+  VPN, aunque el hilo siga vivo.
 - El lector del TUN usa un búfer de 64 KiB: Android puede entregar paquetes
   GSO/TSO de hasta ese tamaño. Un búfer del MTU los truncaba o hacía fallar la
   lectura, y al morir el lector la VPN dejaba de rutear por completo.
@@ -142,6 +145,19 @@ comportamiento observable:
   `host_load = max(flujos_bulk_origen, flujos_bulk_destino)` (dither como Cake).
 - Listas `new_flows` (sparse), `old_flows` (bulk) y `decaying_flows`.
   Los flujos nuevos se sirven antes; al agotar su déficit pasan a bulk.
+  `decaying_flows` solo conserva el estado Cobalt de flujos ya vacíos: no se
+  seleccionan para enviar hasta que vuelvan a tener paquetes, y se podan
+  cuando el AQM llega a reposo. Antes se seleccionaban primero y un flujo
+  vacío podía hacer que el shaper girara 8192 veces por vuelta.
+- La transición sparse→bulk la hace `moveToOld` y **saca el flujo de
+  `newFlows`** antes de insertarlo en `oldFlows`. Si se cambiaba `flow.set`
+  antes de llamar a `moveToOld`, el flujo quedaba en ambas listas; al vaciarse
+  dejaba una entrada obsoleta al frente de `newFlows`, `pick` la seleccionaba
+  para siempre y el shaper dejaba de entregar tráfico real. Eso explicaba que
+  DNS/WhatsApp se quedaran sin subida mientras ICMP (un flujo de un solo
+  paquete) seguía funcionando.
+- `removeFromList` comprueba la pertenencia real a cada lista, no solo
+  `flow.set`, para que ninguna entrada obsoleta sobreviva a un cambio de estado.
 - Al entregar el último paquete de un flujo se cierra su ciclo de inmediato
   (pasa a `decaying` o se libera), como `cake_dequeue`, sin esperar a que
   llegue otro paquete.
@@ -180,6 +196,11 @@ comportamiento observable:
     datos ya confirmados.
 - Los buffers del socket saliente se dimensionan a `2 * BDP` (16 KB–256 KB)
   para que el kernel no acumule segundos de datos fuera del shaper.
+- Un paquete GSO/TSO de subida puede contener decenas de KiB en un solo
+  `Item`. Antes de encolarlo se trocea al tamaño de un segmento
+  (`mtu - overhead`) y cada trozo pasa por el shaper. Así el ritmo se aplica
+  de verdad y no se entrega una ráfaga de 64 KiB de golpe al enlace
+  subyacente, que podía llenar su cola y disparar la latencia.
 
 ## 5. Servicio y UI
 
@@ -233,14 +254,16 @@ comportamiento observable:
 
 ## 6. Pruebas
 
-- 36 pruebas unitarias JVM (`./gradlew testDebugUnitTest`):
+- 40 pruebas unitarias JVM (`./gradlew testDebugUnitTest`):
   - `PacketTest`: checksums, parseo/construcción IPv4/IPv6/TCP/UDP, ICMP,
     fragmentación y modo GSO sin validación de checksum.
   - `SequenceTest`: aritmética modular de secuencias.
   - `CobaltTest`: caché `rec_inv_sqrt` bit a bit y ley de caída.
   - `CakeQueueTest`: ritmo, DRR++, prioridad de flujos nuevos, AQM, buffer,
-    poda de la cola más larga con muchos flujos y cambio de ritmo con reloj
-    inyectado.
+    poda de la cola más larga con muchos flujos, cambio de ritmo con reloj
+    inyectado, transición sparse→bulk sin entradas obsoletas, equidad de un
+    flujo nuevo frente a uno bulk y flujos en decaying que no compiten por el
+    shaper.
   - `IcmpForwarderTest`: una sonda exitosa construye un echo reply real, una
     sonda fallida no inventa respuesta y los paquetes que no son echo request
     se ignoran.

@@ -252,8 +252,30 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 		if (downShaper != null && !downShaper.isAlive()) {
 			return false;
 		}
+		long now = System.nanoTime();
+		/* Un shaper vivo puede quedarse seleccionando una entrada obsoleta
+		 * o bloqueado en una escritura. Si hay backlog y no entrega nada
+		 * durante 15 s, se considera muerto para que el servicio reinicie. */
+		if (upQueue != null && upShaper != null
+				&& upQueue.backlogBytes() > 0
+				&& now - upShaper.lastProgressNanos() > 15_000_000_000L) {
+			Diag.e(TAG, "El shaper de subida lleva "
+					+ ((now - upShaper.lastProgressNanos()) / 1_000_000L)
+					+ " ms sin entregar con " + upQueue.backlogBytes()
+					+ " bytes en cola", null);
+			return false;
+		}
+		if (downQueue != null && downShaper != null
+				&& downQueue.backlogBytes() > 0
+				&& now - downShaper.lastProgressNanos() > 15_000_000_000L) {
+			Diag.e(TAG, "El shaper de bajada lleva "
+					+ ((now - downShaper.lastProgressNanos()) / 1_000_000L)
+					+ " ms sin entregar con " + downQueue.backlogBytes()
+					+ " bytes en cola", null);
+			return false;
+		}
 		long last = lastIterationNanos;
-		return last == 0 || System.nanoTime() - last < 15_000_000_000L;
+		return last == 0 || now - last < 15_000_000_000L;
 	}
 
 	/* ------------------------------ hilos ------------------------------ */
@@ -943,24 +965,44 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 
 	@Override
 	public void enqueueUpload(TcpConnection connection, byte[] payload, int wireLength) {
-		CakeQueue queue = upQueue;
-		if (queue == null) {
-			stats.dropped.incrementAndGet();
-			connection.onUploadDropped(payload.length);
+		if (payload == null || payload.length == 0) {
 			return;
 		}
-		upPending.addAndGet(payload.length);
-		CakeQueue.Item item = new CakeQueue.Item(connection.key(), payload, wireLength,
+		/* Android puede entregar un solo paquete GSO/TSO con decenas de KiB.
+		 * Si se encola entero, el shaper lo entrega de golpe y el enlace
+		 * subyacente recibe una ráfaga que puede llenar su cola. Se trocea
+		 * al tamaño de un segmento para que el ritmo se aplique de verdad. */
+		int overhead = Math.max(0, wireLength - payload.length);
+		int chunkSize = Math.max(1, config.mtu - overhead);
+		for (int offset = 0; offset < payload.length; offset += chunkSize) {
+			int length = Math.min(chunkSize, payload.length - offset);
+			byte[] chunk = (offset == 0 && length == payload.length)
+					? payload
+					: Arrays.copyOfRange(payload, offset, offset + length);
+			enqueueUploadChunk(connection, chunk, length + overhead);
+		}
+	}
+
+	private void enqueueUploadChunk(TcpConnection connection, byte[] chunk, int wireLength) {
+		CakeQueue queue = upQueue;
+		int length = chunk.length;
+		if (queue == null) {
+			stats.dropped.incrementAndGet();
+			connection.onUploadDropped(length);
+			return;
+		}
+		upPending.addAndGet(length);
+		CakeQueue.Item item = new CakeQueue.Item(connection.key(), chunk, wireLength,
 				connection, () -> {
-					upPending.addAndGet(-payload.length);
+					upPending.addAndGet(-length);
 					stats.dropped.incrementAndGet();
-					connection.onUploadDropped(payload.length);
+					connection.onUploadDropped(length);
 				});
 		try {
 			queue.enqueue(item, System.nanoTime());
 		} catch (Throwable error) {
-			upPending.addAndGet(-payload.length);
-			connection.onUploadDropped(payload.length);
+			upPending.addAndGet(-length);
+			connection.onUploadDropped(length);
 			stats.dropped.incrementAndGet();
 			Diag.w(TAG, "No se pudo encolar datos TCP de subida", error);
 		}

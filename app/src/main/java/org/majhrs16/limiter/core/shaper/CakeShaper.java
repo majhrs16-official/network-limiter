@@ -16,6 +16,7 @@ public final class CakeShaper implements Runnable {
 	private final CakeQueue queue;
 	private final Sink sink;
 	private volatile boolean running;
+	private volatile long lastProgressNanos;
 	private Thread thread;
 
 	public CakeShaper(String name, CakeQueue queue, Sink sink) {
@@ -33,6 +34,7 @@ public final class CakeShaper implements Runnable {
 			return;
 		}
 		running = true;
+		lastProgressNanos = System.nanoTime();
 		thread = new Thread(this, name);
 		thread.setDaemon(true);
 		thread.start();
@@ -65,29 +67,48 @@ public final class CakeShaper implements Runnable {
 		return t != null && t.isAlive();
 	}
 
+	/**
+	 * Instante de la última entrega. Si hay backlog y esto envejece, el
+	 * shaper está vivo pero atascado; el motor puede reiniciar la VPN.
+	 */
+	public long lastProgressNanos() {
+		return lastProgressNanos;
+	}
+
 	@Override
 	public void run() {
 		while (running) {
 			CakeQueue.Poll poll;
-			synchronized (queue) {
-				poll = queue.poll(System.nanoTime());
-				if (poll.item == null) {
-					long millis;
-					if (poll.waitNanos == Long.MAX_VALUE) {
-						millis = 100;
-					} else {
-						millis = Math.max(1, Math.min(100, poll.waitNanos / 1_000_000L));
-					}
-					try {
-						queue.wait(millis);
-					} catch (InterruptedException e) {
-						Thread.currentThread().interrupt();
-						return;
+			try {
+				synchronized (queue) {
+					poll = queue.poll(System.nanoTime());
+					if (poll.item == null) {
+						long millis;
+						if (poll.waitNanos == Long.MAX_VALUE) {
+							millis = 100;
+						} else {
+							millis = Math.max(1,
+									Math.min(100, poll.waitNanos / 1_000_000L));
+						}
+						try {
+							queue.wait(millis);
+						} catch (InterruptedException e) {
+							Thread.currentThread().interrupt();
+							return;
+						}
 					}
 				}
+			} catch (Throwable error) {
+				/* Si la cola queda corrupta es mejor detener el hilo para
+				 * que el watchdog reinicie la VPN, no dejarlo en un bucle
+				 * silencioso que no entrega nada. */
+				running = false;
+				Diag.e(name, "La cola del shaper falló; se detiene el hilo", error);
+				return;
 			}
 
 			if (poll.item != null) {
+				lastProgressNanos = System.nanoTime();
 				try {
 					sink.accept(poll.item);
 				} catch (Throwable t) {
