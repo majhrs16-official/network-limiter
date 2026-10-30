@@ -123,6 +123,10 @@ app/src/main/java/org/majhrs16/limiter/
   global y una ruta por defecto IPv6. Los DNS IPv6 se omiten en redes
   IPv4-only y, si no hay ningún DNS IPv4, se añaden `1.1.1.1` y `8.8.8.8` como
   respaldo.
+- El motor limita la E/S de cada conexión por despacho y da prioridad al ICMP
+  en el buzón del TUN, para que una descarga o subida intensa no silencie el
+  ping. Un watchdog vuelca la pila del motor en **Registros** si el
+  multiplexado deja de avanzar.
 - El split tunneling se aplica al arrancar el túnel: cambiarlo con la VPN
   activa provoca un reinicio breve del servicio.
 - La lista de apps se carga en el hilo principal al abrir la página por primera

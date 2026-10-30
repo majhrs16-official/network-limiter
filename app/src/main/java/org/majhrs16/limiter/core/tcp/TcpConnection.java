@@ -21,6 +21,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Conexión TCP terminada en espacio de usuario.
@@ -53,6 +54,9 @@ public final class TcpConnection {
 	private static final long IDLE_TIMEOUT = 300_000_000_000L;
 	private static final long FIN_WAIT2_TIMEOUT = 60_000_000_000L;
 	private static final long RCV_BUF_CAPACITY = 512L * 1024L;
+	/* Presupuesto de E/S por despacho: evita que una conexión acapare el
+	 * hilo del selector y deje sin servicio al resto del tráfico. */
+	private static final int MAX_IO_ITERATIONS = 64;
 
 	private static final Delivery NOOP = new Delivery() {
 		@Override
@@ -102,7 +106,9 @@ public final class TcpConnection {
 	private long rttSampleSeq;
 	private int dupAcks;
 
-	private long pendingUpBytes;
+	/* Lo modifican el hilo del selector (onWritable) y el del shaper de
+	 * subida (onUploadDropped); debe ser atómico. */
+	private final AtomicLong pendingUpBytes = new AtomicLong();
 	private final ArrayDeque<byte[]> pendingUp = new ArrayDeque<>();
 	private final ConcurrentLinkedQueue<byte[]> outbound = new ConcurrentLinkedQueue<>();
 	private final ByteBuffer readBuffer;
@@ -255,7 +261,7 @@ public final class TcpConnection {
 			return;
 		}
 		try {
-			while (true) {
+			for (int iteration = 0; iteration < MAX_IO_ITERATIONS; iteration++) {
 				long allowed = sendAvailable();
 				if (allowed <= 0) {
 					break;
@@ -294,14 +300,14 @@ public final class TcpConnection {
 			return;
 		}
 		try {
-			while (true) {
+			for (int iteration = 0; iteration < MAX_IO_ITERATIONS; iteration++) {
 				byte[] chunk = partialWrite;
 				if (chunk != null) {
 					int written = channel.write(ByteBuffer.wrap(chunk));
 					if (written <= 0) {
 						break;
 					}
-					pendingUpBytes = Math.max(0, pendingUpBytes - written);
+					pendingUpBytes.updateAndGet(value -> Math.max(0, value - written));
 					if (written < chunk.length) {
 						partialWrite = Arrays.copyOfRange(chunk, written, chunk.length);
 						break;
@@ -318,7 +324,7 @@ public final class TcpConnection {
 				if (written <= 0) {
 					break;
 				}
-				pendingUpBytes = Math.max(0, pendingUpBytes - written);
+				pendingUpBytes.updateAndGet(value -> Math.max(0, value - written));
 				if (written < chunk.length) {
 					outbound.poll();
 					partialWrite = Arrays.copyOfRange(chunk, written, chunk.length);
@@ -462,8 +468,12 @@ public final class TcpConnection {
 	 * Se libera el hueco de recepción para no cerrar la ventana para siempre.
 	 */
 	public void onUploadDropped(int bytes) {
-		pendingUpBytes = Math.max(0, pendingUpBytes - bytes);
-		Diag.w(TAG, "Shaper descartó " + bytes + " bytes de subida para " + key);
+		pendingUpBytes.updateAndGet(value -> Math.max(0, value - bytes));
+		/* Un descarte es esperado bajo carga; no debe generar una tormenta
+		 * de logs que compita con el propio motor. */
+		if (Diag.isPacketTrace()) {
+			Diag.d(TAG, "Shaper descartó " + bytes + " bytes de subida para " + key);
+		}
 	}
 
 	public void updateInterest() {
@@ -643,12 +653,12 @@ public final class TcpConnection {
 	}
 
 	private boolean accept(IpPacket ip, TcpSegment segment, int skip, int len) {
-		long free = RCV_BUF_CAPACITY - pendingUpBytes;
+		long free = RCV_BUF_CAPACITY - pendingUpBytes.get();
 		if (len > free) {
 			return false;
 		}
 		byte[] data = copy(ip, segment, skip, len);
-		pendingUpBytes += len;
+		pendingUpBytes.addAndGet(len);
 		if (connected && state != SYN_RECEIVED) {
 			cb.enqueueUpload(this, data, len + overhead);
 		} else {
@@ -658,10 +668,10 @@ public final class TcpConnection {
 	}
 
 	private boolean acceptBytes(byte[] data) {
-		if (data.length > RCV_BUF_CAPACITY - pendingUpBytes) {
+		if (data.length > RCV_BUF_CAPACITY - pendingUpBytes.get()) {
 			return false;
 		}
-		pendingUpBytes += data.length;
+		pendingUpBytes.addAndGet(data.length);
 		if (connected && state != SYN_RECEIVED) {
 			cb.enqueueUpload(this, data, data.length + overhead);
 		} else {
@@ -831,7 +841,7 @@ public final class TcpConnection {
 	}
 
 	private long rcvWnd() {
-		long free = RCV_BUF_CAPACITY - pendingUpBytes;
+		long free = RCV_BUF_CAPACITY - pendingUpBytes.get();
 		if (free < 0) {
 			free = 0;
 		}

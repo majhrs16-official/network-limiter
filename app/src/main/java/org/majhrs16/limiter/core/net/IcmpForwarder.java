@@ -22,8 +22,12 @@ public final class IcmpForwarder {
 	}
 
 	private static final String TAG = "IcmpForwarder";
-	private static final int MAX_PENDING = 32;
-	private static final int TIMEOUT_MS = 1200;
+	private static final int MAX_PENDING = 64;
+	/* Con la red subyacente cargada (navegador/WhatsApp) el RTT del eco
+	 * puede superar un segundo; un timeout demasiado corto haría que el
+	 * ping dejara de responder aunque el destino sí conteste. */
+	private static final int TIMEOUT_MS = 2000;
+	private static final int PROBE_THREADS = 4;
 
 	private final IcmpProbe probe;
 	private final Sink sink;
@@ -41,7 +45,7 @@ public final class IcmpForwarder {
 			return;
 		}
 		running = true;
-		executor = Executors.newFixedThreadPool(2, runnable -> {
+		executor = Executors.newFixedThreadPool(PROBE_THREADS, runnable -> {
 			Thread thread = new Thread(runnable, "icmp-probe");
 			thread.setDaemon(true);
 			return thread;

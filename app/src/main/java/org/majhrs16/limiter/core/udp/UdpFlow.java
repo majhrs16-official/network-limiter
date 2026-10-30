@@ -46,6 +46,7 @@ public final class UdpFlow {
 
 	private static final long IDLE_TIMEOUT = 60_000_000_000L;
 	private static final int MAX_OUTBOUND_BYTES = 64 * 1024;
+	private static final int MAX_IO_ITERATIONS = 32;
 	private static final AtomicInteger IP_ID = new AtomicInteger(1);
 	private static final String TAG = "UdpFlow";
 
@@ -89,7 +90,7 @@ public final class UdpFlow {
 		}
 		ByteBuffer buffer = cb.readBuffer();
 		try {
-			while (true) {
+			for (int iteration = 0; iteration < MAX_IO_ITERATIONS; iteration++) {
 				buffer.clear();
 				int read = channel.read(buffer);
 				if (read <= 0) {
@@ -135,7 +136,7 @@ public final class UdpFlow {
 			return;
 		}
 		try {
-			while (true) {
+			for (int iteration = 0; iteration < MAX_IO_ITERATIONS; iteration++) {
 				byte[] data = outbound.peek();
 				if (data == null) {
 					break;

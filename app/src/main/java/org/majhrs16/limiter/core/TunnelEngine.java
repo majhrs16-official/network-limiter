@@ -70,6 +70,8 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 	private final Stats stats;
 	private final IcmpProbe icmpProbe;
 	private final ArrayBlockingQueue<byte[]> inbox = new ArrayBlockingQueue<>(2048);
+	/* El ping no debe morir porque una descarga llene el buzón principal. */
+	private final ArrayBlockingQueue<byte[]> icmpInbox = new ArrayBlockingQueue<>(256);
 	private final Map<FlowKey, TcpConnection> tcp = new HashMap<>();
 	private final Map<FlowKey, UdpFlow> udp = new HashMap<>();
 
@@ -81,6 +83,8 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 	private FileOutputStream tunOut;
 	private Thread loopThread;
 	private Thread readerThread;
+	private Thread watchdogThread;
+	private volatile long lastIterationNanos;
 	private CakeQueue upQueue;
 	private CakeQueue downQueue;
 	private CakeShaper upShaper;
@@ -142,6 +146,10 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 		loopThread.setDaemon(true);
 		loopThread.start();
 
+		watchdogThread = new Thread(this::watchdogLoop, "tunnel-watchdog");
+		watchdogThread.setDaemon(true);
+		watchdogThread.start();
+
 		Diag.i(TAG, "Motor iniciado (up=" + config.upKbps + " kbps, down="
 				+ config.downKbps + " kbps, rtt=" + config.rttMs + " ms)");
 	}
@@ -176,6 +184,16 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 
 		join(loopThread);
 		join(readerThread);
+		Thread watchdog = watchdogThread;
+		if (watchdog != null) {
+			watchdog.interrupt();
+			try {
+				watchdog.join(1000);
+			} catch (InterruptedException interrupted) {
+				Thread.currentThread().interrupt();
+			}
+			watchdogThread = null;
+		}
 
 		long now = System.nanoTime();
 		for (TcpConnection connection : new ArrayList<>(tcp.values())) {
@@ -237,10 +255,20 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 				continue;
 			}
 			byte[] packet = Arrays.copyOf(buffer, read);
-			if (!inbox.offer(packet)) {
+			ArrayBlockingQueue<byte[]> target = isIcmpPacket(packet)
+					? icmpInbox
+					: inbox;
+			boolean queued = target.offer(packet);
+			/* Si el buzón ICMP está lleno, el principal sigue siendo una
+			 * alternativa mejor que descartar el eco. */
+			if (!queued && target != inbox) {
+				queued = inbox.offer(packet);
+			}
+			if (!queued) {
 				stats.dropped.incrementAndGet();
 				if (Diag.isPacketTrace()) {
-					Diag.w(TAG, "Buzón del TUN lleno; paquete descartado (" + read + " bytes)");
+					Diag.w(TAG, "Buzón del TUN lleno; paquete descartado ("
+							+ read + " bytes)");
 				}
 				continue;
 			}
@@ -251,17 +279,56 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 		}
 	}
 
+	/**
+	 * Vigila que el hilo del selector siga avanzando. Si una conexión o una
+	 * escritura lo bloquea, el volcado de pila aparece en la pestaña de
+	 * registros y permite identificar el punto exacto.
+	 */
+	private void watchdogLoop() {
+		while (running) {
+			try {
+				Thread.sleep(5000);
+			} catch (InterruptedException interrupted) {
+				return;
+			}
+			if (!running) {
+				return;
+			}
+			long last = lastIterationNanos;
+			if (last == 0) {
+				continue;
+			}
+			long age = System.nanoTime() - last;
+			if (age < 5_000_000_000L) {
+				continue;
+			}
+			Thread engine = loopThread;
+			Throwable trace = new Throwable("Iteración del motor detenida");
+			if (engine != null) {
+				trace.setStackTrace(engine.getStackTrace());
+			}
+			Diag.e(TAG, "El motor lleva " + (age / 1_000_000L)
+					+ " ms sin completar una iteración", trace);
+		}
+	}
+
 	@Override
 	public void run() {
 		long lastTick = 0;
 		long lastSample = 0;
 		while (running) {
+			lastIterationNanos = System.nanoTime();
 			try {
 				Selector s = selector;
 				if (s == null) {
 					break;
 				}
-				s.select(50);
+				if (inbox.isEmpty() && icmpInbox.isEmpty()) {
+					s.select(50);
+				} else {
+					/* Hay trabajo pendiente del TUN: no dormir 50 ms. */
+					s.selectNow();
+				}
 				long now = System.nanoTime();
 
 				Iterator<SelectionKey> iterator = s.selectedKeys().iterator();
@@ -342,7 +409,10 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 
 	private void drainInbox(long now) {
 		for (int i = 0; i < 512; i++) {
-			byte[] packet = inbox.poll();
+			byte[] packet = icmpInbox.poll();
+			if (packet == null) {
+				packet = inbox.poll();
+			}
 			if (packet == null) {
 				return;
 			}
@@ -361,14 +431,16 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 	 * tras despertar hay que reactivar OP_WRITE en los sockets afectados.
 	 */
 	private void refreshInterests() {
-		for (TcpConnection connection : tcp.values()) {
+		/* Copia defensiva: un cierre durante la actualización no debe
+		 * invalidar el iterador del mapa. */
+		for (TcpConnection connection : new ArrayList<>(tcp.values())) {
 			try {
 				connection.updateInterest();
 			} catch (Throwable error) {
 				Diag.w(TAG, "No se pudo actualizar el interés de un TCP", error);
 			}
 		}
-		for (UdpFlow flow : udp.values()) {
+		for (UdpFlow flow : new ArrayList<>(udp.values())) {
 			try {
 				flow.updateInterest();
 			} catch (Throwable error) {
@@ -621,6 +693,21 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 		enqueueDownload(packet, flow, NOOP);
 	}
 
+	/** Clasifica el paquete para dar prioridad al eco ICMP/ICMPv6. */
+	private static boolean isIcmpPacket(byte[] packet) {
+		if (packet == null || packet.length < 1) {
+			return false;
+		}
+		int version = (packet[0] >> 4) & 0x0F;
+		if (version == 4) {
+			return packet.length >= 10 && (packet[9] & 0xFF) == 1;
+		}
+		if (version == 6) {
+			return packet.length >= 7 && (packet[6] & 0xFF) == 58;
+		}
+		return false;
+	}
+
 	/** Direcciones que no tienen sentido fuera del enlace local. */
 	private static boolean isLocalOnly(byte[] dst) {
 		if (dst.length == 4) {
@@ -795,6 +882,7 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 		CakeQueue.Item item = new CakeQueue.Item(connection.key(), payload, wireLength,
 				connection, () -> {
 					upPending.addAndGet(-payload.length);
+					stats.dropped.incrementAndGet();
 					connection.onUploadDropped(payload.length);
 				});
 		try {
@@ -815,7 +903,10 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 		}
 		upPending.addAndGet(payload.length);
 		CakeQueue.Item item = new CakeQueue.Item(flow.key(), payload, wireLength, flow,
-				() -> upPending.addAndGet(-payload.length));
+				() -> {
+					upPending.addAndGet(-payload.length);
+					stats.dropped.incrementAndGet();
+				});
 		try {
 			queue.enqueue(item, System.nanoTime());
 		} catch (Throwable error) {

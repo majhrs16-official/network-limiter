@@ -49,6 +49,32 @@ referencia (`rtt`) que alimenta el AQM Cobalt.
 
 No hay un hilo por conexión: un `Selector` multiplexa todos los sockets.
 
+### Concurrencia y fairness
+
+El hilo del motor es el único que toca los mapas TCP/UDP, pero comparte estado
+con los hilos de los shapers. Para que una descarga o una subida intensa no
+deje sin servicio al resto del tráfico:
+
+- Cada despacho de E/S tiene un presupuesto (64 iteraciones TCP, 32 UDP). Al
+  agotarlo se conserva el interés `OP_READ`/`OP_WRITE` y el selector vuelve a
+  llamar; una conexión no puede acaparar el hilo del motor.
+- `pendingUpBytes` es un `AtomicLong`: lo leen/escriben el motor y el shaper de
+  subida al mismo tiempo. Antes era un `long` y una actualización perdida podía
+  dejar la ventana de recepción cerrada para siempre.
+- El buzón del TUN tiene una cola prioritaria para ICMP/ICMPv6 (256 paquetes)
+  además del buzón general (2048). Así un `ping` sigue respondiendo aunque una
+  página web sature el buzón con TCP.
+- `refreshInterests()` itera copias de los mapas para que un cierre durante la
+  actualización no invalide el iterador.
+- Los descartes de subida ya no escriben un `WARN` por paquete; solo se
+  registran en modo de trazado de paquetes, evitando una tormenta de logs que
+  compita con el motor.
+- Un watchdog cada 5 s comprueba que el hilo del motor completa iteraciones. Si
+  se queda bloqueado, vuelca su pila en la pestaña de registros.
+- El reenviador ICMP usa 4 hilos, 64 sondas pendientes y 2 s de timeout (más
+  un respaldo de 1 s con `isReachable`) para tolerar una red subyacente
+  cargada sin dejar de responder al ping.
+
 ## 3. Pila TCP/IP en espacio de usuario
 
 ### Capa IP
@@ -180,7 +206,8 @@ comportamiento observable:
 - **Registros:** búfer circular `Diag` de 3000 entradas que conserva todos los
   niveles (incluido debug) y se replica a Logcat si el servicio está activo.
   La pestaña permite activar el trazado paquete a paquete, limpiar, copiar al
-  portapapeles y hacer auto-scroll. No requiere adb.
+  portapapeles y hacer auto-scroll. No requiere adb. El watchdog del motor
+  escribe allí el volcado de pila si el multiplexado se queda bloqueado.
 - **Split tunneling:** lista de apps instaladas con búsqueda, filtro de apps
   del sistema y selección múltiple. Modos: todas, solo seleccionadas y todas
   excepto las seleccionadas. La app propia se excluye siempre. Android no
