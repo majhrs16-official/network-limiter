@@ -92,6 +92,43 @@ public class PacketTest {
 	}
 
 	@Test
+	public void tcpChecksumCanBeSkippedForGsoPackets() throws Exception {
+		byte[] packet = TcpSegment.build(ip("10.0.0.1"), ip("10.0.0.2"),
+				1, 2, 10, 20, TcpSegment.ACK, 1000,
+				"datos".getBytes(StandardCharsets.US_ASCII), 0, 5, 0, -1, false);
+		IpPacket ipPacket = IpPacket.parse(packet);
+		assertNotNull(ipPacket);
+		int checksumOffset = ipPacket.payloadOffset + 16;
+		packet[checksumOffset] ^= 0x01;
+
+		IpPacket partial = IpPacket.parse(packet);
+		assertNotNull(partial);
+		assertNull(TcpSegment.parse(partial));
+		TcpSegment segment = TcpSegment.parse(partial, false);
+		assertNotNull(segment);
+		assertEquals(1, segment.srcPort);
+		assertEquals(5, segment.payloadLength);
+	}
+
+	@Test
+	public void udpChecksumCanBeSkippedForGsoPackets() throws Exception {
+		byte[] packet = UdpDatagram.build(ip("2001:db8::1"), ip("2001:db8::2"),
+				5353, 53, "dns".getBytes(StandardCharsets.US_ASCII), 0, 3);
+		IpPacket ipPacket = IpPacket.parse(packet);
+		assertNotNull(ipPacket);
+		int checksumOffset = ipPacket.payloadOffset + 6;
+		packet[checksumOffset] ^= 0x01;
+
+		IpPacket partial = IpPacket.parse(packet);
+		assertNotNull(partial);
+		assertNull(UdpDatagram.parse(partial));
+		UdpDatagram datagram = UdpDatagram.parse(partial, false);
+		assertNotNull(datagram);
+		assertEquals(5353, datagram.srcPort);
+		assertEquals(3, datagram.payloadLength);
+	}
+
+	@Test
 	public void ipv4HeaderChecksumRejectsCorruption() throws Exception {
 		byte[] packet = TcpSegment.build(ip("10.0.0.1"), ip("10.0.0.2"),
 				1, 2, 10, 20, TcpSegment.ACK, 1000, null, 0, 0, 0, -1, false);

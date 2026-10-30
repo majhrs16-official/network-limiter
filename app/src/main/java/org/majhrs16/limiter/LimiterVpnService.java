@@ -70,6 +70,14 @@ public class LimiterVpnService extends VpnService {
 			if (!running) {
 				return;
 			}
+			TunnelEngine current = engine;
+			if (current != null && !current.isHealthy()) {
+				Diag.e(TAG, "El motor del túnel dejó de avanzar; se reinicia la VPN",
+						null);
+				stopVpn();
+				startVpn();
+				return;
+			}
 			updateNotification();
 			if (handler != null) {
 				handler.postDelayed(this, 2000);

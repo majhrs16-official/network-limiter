@@ -61,6 +61,17 @@ public final class TcpSegment {
 	}
 
 	public static TcpSegment parse(IpPacket ip) {
+		return parse(ip, true);
+	}
+
+	/**
+	 * @param validateChecksum los paquetes que llegan del TUN pueden venir de
+	 *                         GSO/TSO con checksum parcial; el kernel local es
+	 *                         de confianza y el socket de salida recalcula el
+	 *                         checksum, así que el motor puede omitir esta
+	 *                         validación.
+	 */
+	public static TcpSegment parse(IpPacket ip, boolean validateChecksum) {
 		if (ip == null || ip.protocol != IpPacket.PROTO_TCP || ip.payloadLength < 20) {
 			return null;
 		}
@@ -73,10 +84,12 @@ public final class TcpSegment {
 			return null;
 		}
 
-		int pseudo = Checksum.pseudoHeader(ip.src, ip.dst, IpPacket.PROTO_TCP, len);
-		int acc = Checksum.sum(pkt, off, len, pseudo);
-		if (Checksum.fold(acc) != 0xFFFF) {
-			return null;
+		if (validateChecksum) {
+			int pseudo = Checksum.pseudoHeader(ip.src, ip.dst, IpPacket.PROTO_TCP, len);
+			int acc = Checksum.sum(pkt, off, len, pseudo);
+			if (Checksum.fold(acc) != 0xFFFF) {
+				return null;
+			}
 		}
 
 		int srcPort = Checksum.getShort(pkt, off);

@@ -70,7 +70,18 @@ deje sin servicio al resto del tráfico:
   registran en modo de trazado de paquetes, evitando una tormenta de logs que
   compita con el motor.
 - Un watchdog cada 5 s comprueba que el hilo del motor completa iteraciones. Si
-  se queda bloqueado, vuelca su pila en la pestaña de registros.
+  se queda bloqueado, vuelca su pila en la pestaña de registros. También
+  vigila que el lector del TUN y los dos shapers sigan vivos.
+- El lector del TUN usa un búfer de 64 KiB: Android puede entregar paquetes
+  GSO/TSO de hasta ese tamaño. Un búfer del MTU los truncaba o hacía fallar la
+  lectura, y al morir el lector la VPN dejaba de rutear por completo.
+- Los paquetes que llegan del TUN se parsean sin validar el checksum TCP/UDP:
+  en GSO/TSO puede ser parcial. El kernel local generó el paquete y el socket
+  de salida recalcula el checksum; los tests siguen validando el modo estricto.
+- Un error transitorio de lectura del TUN se reintenta; tras 10 fallos
+  consecutivos el lector se detiene. `TunnelEngine.isHealthy()` detecta hilos
+  muertos o una iteración estancada más de 15 s y el servicio reinicia la VPN
+  automáticamente.
 - El reenviador ICMP usa 4 hilos, 64 sondas pendientes y 2 s de timeout (más
   un respaldo de 1 s con `isReachable`) para tolerar una red subyacente
   cargada sin dejar de responder al ping.
@@ -222,9 +233,9 @@ comportamiento observable:
 
 ## 6. Pruebas
 
-- 34 pruebas unitarias JVM (`./gradlew testDebugUnitTest`):
+- 36 pruebas unitarias JVM (`./gradlew testDebugUnitTest`):
   - `PacketTest`: checksums, parseo/construcción IPv4/IPv6/TCP/UDP, ICMP,
-    fragmentación.
+    fragmentación y modo GSO sin validación de checksum.
   - `SequenceTest`: aritmética modular de secuencias.
   - `CobaltTest`: caché `rec_inv_sqrt` bit a bit y ley de caída.
   - `CakeQueueTest`: ritmo, DRR++, prioridad de flujos nuevos, AQM, buffer,

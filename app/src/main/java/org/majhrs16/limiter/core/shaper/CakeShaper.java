@@ -59,6 +59,12 @@ public final class CakeShaper implements Runnable {
 		return running;
 	}
 
+	/** Indica si el hilo del shaper sigue vivo (para el watchdog). */
+	public boolean isAlive() {
+		Thread t = thread;
+		return t != null && t.isAlive();
+	}
+
 	@Override
 	public void run() {
 		while (running) {

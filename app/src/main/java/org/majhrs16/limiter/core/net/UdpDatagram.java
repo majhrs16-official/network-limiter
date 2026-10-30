@@ -24,6 +24,16 @@ public final class UdpDatagram {
 	}
 
 	public static UdpDatagram parse(IpPacket ip) {
+		return parse(ip, true);
+	}
+
+	/**
+	 * @param validateChecksum los paquetes que llegan del TUN pueden venir de
+	 *                         GSO/UFO con checksum parcial; el kernel local es
+	 *                         de confianza y el socket de salida recalcula el
+	 *                         checksum.
+	 */
+	public static UdpDatagram parse(IpPacket ip, boolean validateChecksum) {
 		if (ip == null || ip.protocol != IpPacket.PROTO_UDP || ip.payloadLength < 8) {
 			return null;
 		}
@@ -36,7 +46,7 @@ public final class UdpDatagram {
 
 		int checksum = Checksum.getShort(pkt, off + 6);
 		/* En IPv4 el checksum es opcional (0 = no calculado). */
-		if (ip.version == 6 || checksum != 0) {
+		if (validateChecksum && (ip.version == 6 || checksum != 0)) {
 			int pseudo = Checksum.pseudoHeader(ip.src, ip.dst, IpPacket.PROTO_UDP, udpLength);
 			int acc = Checksum.sum(pkt, off, udpLength, pseudo);
 			if (Checksum.fold(acc) != 0xFFFF) {

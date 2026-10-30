@@ -232,26 +232,80 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 				+ copy.downKbps + " kbps, rtt=" + copy.rttMs + " ms");
 	}
 
+	/**
+	 * Comprueba que los hilos críticos siguen vivos y que el selector no lleva
+	 * demasiado tiempo sin completar una iteración. El servicio usa esto para
+	 * reiniciar la VPN si el multiplexado se queda muerto.
+	 */
+	public boolean isHealthy() {
+		if (!running) {
+			return true;
+		}
+		Thread loop = loopThread;
+		Thread reader = readerThread;
+		if (loop == null || !loop.isAlive() || reader == null || !reader.isAlive()) {
+			return false;
+		}
+		if (upShaper != null && !upShaper.isAlive()) {
+			return false;
+		}
+		if (downShaper != null && !downShaper.isAlive()) {
+			return false;
+		}
+		long last = lastIterationNanos;
+		return last == 0 || System.nanoTime() - last < 15_000_000_000L;
+	}
+
 	/* ------------------------------ hilos ------------------------------ */
 
 	private void readLoop() {
-		byte[] buffer = new byte[Math.max(config.mtu + 256, 2048)];
+		/* Android puede entregar paquetes GSO/TSO de hasta 64 KiB. Un búfer
+		 * del tamaño del MTU los trunca o hace fallar la lectura, y entonces
+		 * el lector muere y la VPN deja de rutear por completo. */
+		byte[] buffer = new byte[Math.max(config.mtu + 256, 65536)];
 		FileInputStream input = tunIn;
 		if (input == null) {
 			Diag.e(TAG, "Lector del TUN sin flujo de entrada", null);
 			return;
 		}
+		int consecutiveErrors = 0;
 		while (running) {
 			int read;
 			try {
 				read = input.read(buffer);
+				consecutiveErrors = 0;
+			} catch (IOException error) {
+				if (!running) {
+					break;
+				}
+				consecutiveErrors++;
+				if (consecutiveErrors >= 10) {
+					Diag.e(TAG, "El TUN falla repetidamente; se detiene el lector",
+							error);
+					break;
+				}
+				/* Un fallo transitorio no debe matar el lector. */
+				Diag.w(TAG, "Lectura del TUN falló; se reintenta", error);
+				try {
+					Thread.sleep(100);
+				} catch (InterruptedException interrupted) {
+					Thread.currentThread().interrupt();
+					break;
+				}
+				continue;
 			} catch (Throwable error) {
 				if (running) {
-					Diag.w(TAG, "Lectura del TUN terminó", error);
+					Diag.e(TAG, "Lector del TUN detenido por error", error);
 				}
 				break;
 			}
-			if (read <= 0) {
+			if (read < 0) {
+				if (running) {
+					Diag.w(TAG, "El TUN devolvió EOF; se detiene el lector", null);
+				}
+				break;
+			}
+			if (read == 0) {
 				continue;
 			}
 			byte[] packet = Arrays.copyOf(buffer, read);
@@ -277,6 +331,9 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 				s.wakeup();
 			}
 		}
+		if (running) {
+			Diag.w(TAG, "Lector del TUN terminado inesperadamente", null);
+		}
 	}
 
 	/**
@@ -293,6 +350,17 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 			}
 			if (!running) {
 				return;
+			}
+			Thread reader = readerThread;
+			if (reader != null && !reader.isAlive()) {
+				Diag.e(TAG, "El lector del TUN se detuvo; no entrarán más paquetes",
+						null);
+			}
+			if (upShaper != null && !upShaper.isAlive()) {
+				Diag.e(TAG, "El shaper de subida se detuvo", null);
+			}
+			if (downShaper != null && !downShaper.isAlive()) {
+				Diag.e(TAG, "El shaper de bajada se detuvo", null);
 			}
 			long last = lastIterationNanos;
 			if (last == 0) {
@@ -494,7 +562,10 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 
 		switch (ip.protocol) {
 			case IpPacket.PROTO_TCP: {
-				TcpSegment segment = TcpSegment.parse(ip);
+				/* El TUN puede entregar GSO/TSO con checksum parcial; el
+				 * kernel local ya validó el paquete y el socket de salida
+				 * recalcula el checksum. */
+				TcpSegment segment = TcpSegment.parse(ip, false);
 				if (segment == null) {
 					stats.badPackets.incrementAndGet();
 					return;
@@ -503,7 +574,7 @@ public final class TunnelEngine implements Runnable, TcpCallbacks, UdpFlow.Callb
 				break;
 			}
 			case IpPacket.PROTO_UDP: {
-				UdpDatagram datagram = UdpDatagram.parse(ip);
+				UdpDatagram datagram = UdpDatagram.parse(ip, false);
 				if (datagram == null) {
 					stats.badPackets.incrementAndGet();
 					return;

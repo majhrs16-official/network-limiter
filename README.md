@@ -124,9 +124,14 @@ app/src/main/java/org/majhrs16/limiter/
   IPv4-only y, si no hay ningún DNS IPv4, se añaden `1.1.1.1` y `8.8.8.8` como
   respaldo.
 - El motor limita la E/S de cada conexión por despacho y da prioridad al ICMP
-  en el buzón del TUN, para que una descarga o subida intensa no silencie el
-  ping. Un watchdog vuelca la pila del motor en **Registros** si el
-  multiplexado deja de avanzar.
+  en el buzón del TUN. Un watchdog vuelca la pila del motor en **Registros** si
+  el multiplexado deja de avanzar y el servicio reinicia la VPN si el lector
+  del TUN o un shaper muere, o si el motor se estanca más de 15 s.
+- La lectura del TUN admite paquetes GSO/TSO de hasta 64 KiB y no valida el
+  checksum TCP/UDP de los paquetes que vienen del kernel local (puede ser
+  parcial con GSO); el socket de salida lo recalcula. Sin esto, una descarga o
+  subida intensa podía truncar el paquete, matar el lector y dejar la VPN sin
+  rutear.
 - El split tunneling se aplica al arrancar el túnel: cambiarlo con la VPN
   activa provoca un reinicio breve del servicio.
 - La lista de apps se carga en el hilo principal al abrir la página por primera
