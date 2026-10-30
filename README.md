@@ -116,26 +116,3 @@ app/src/main/java/org/majhrs16/limiter/
 
 Este proyecto se distribuye bajo la **GNU General Public License v3.0**. El
 texto completo está en [`LICENSE`](LICENSE).
-
-## Publicar en GitHub por SSH
-
-El repositorio remoto es
-[`majhrs16-official/network-limiter`](https://github.com/majhrs16-official/network-limiter)
-y ya contiene la licencia. Para trabajar con él:
-
-```sh
-# Verifica la autenticación SSH (debe responder "Hi <usuario>!")
-ssh -T git@github.com
-
-# Si aún no existe el remoto:
-git remote add origin git@github.com:majhrs16-official/network-limiter.git
-
-# Trae los cambios remotos y reaplica el trabajo local encima:
-git pull --rebase origin main
-
-# Publica:
-git push -u origin main
-```
-
-No se debe borrar `LICENSE`: el `pull --rebase` lo conserva porque el commit
-local no lo modifica.
