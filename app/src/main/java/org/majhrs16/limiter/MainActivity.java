@@ -1,6 +1,7 @@
 package org.majhrs16.limiter;
 
 import android.Manifest;
+import android.annotation.SuppressLint;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ApplicationInfo;
@@ -473,6 +474,7 @@ public class MainActivity extends AppCompatActivity {
 				(int) Math.min(Integer.MAX_VALUE, dropsCount), dropsCount));
 	}
 
+	@SuppressLint("BatteryLife")
 	private void openBatterySettings() {
 		try {
 			Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
