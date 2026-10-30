@@ -254,7 +254,7 @@ comportamiento observable:
 
 ## 6. Pruebas
 
-- 40 pruebas unitarias JVM (`./gradlew testDebugUnitTest`):
+- 41 pruebas unitarias JVM (`./gradlew testDebugUnitTest`):
   - `PacketTest`: checksums, parseo/construcción IPv4/IPv6/TCP/UDP, ICMP,
     fragmentación y modo GSO sin validación de checksum.
   - `SequenceTest`: aritmética modular de secuencias.
@@ -262,8 +262,8 @@ comportamiento observable:
   - `CakeQueueTest`: ritmo, DRR++, prioridad de flujos nuevos, AQM, buffer,
     poda de la cola más larga con muchos flujos, cambio de ritmo con reloj
     inyectado, transición sparse→bulk sin entradas obsoletas, equidad de un
-    flujo nuevo frente a uno bulk y flujos en decaying que no compiten por el
-    shaper.
+    flujo nuevo frente a uno bulk, flujos mixtos que drenan y dejan paso a uno
+    nuevo, y flujos en decaying que no compiten por el shaper.
   - `IcmpForwarderTest`: una sonda exitosa construye un echo reply real, una
     sonda fallida no inventa respuesta y los paquetes que no son echo request
     se ignoran.

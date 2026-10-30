@@ -84,7 +84,7 @@ app ofrece los tres modos habituales:
 ./gradlew lintDebug
 ```
 
-Las 40 pruebas JVM cubren checksums y paquetes IPv4/IPv6/TCP/UDP, ICMP,
+Las 41 pruebas JVM cubren checksums y paquetes IPv4/IPv6/TCP/UDP, ICMP,
 fragmentación, aritmética de secuencias, handshake TCP, NAT UDP, Cake (ritmo,
 DRR++, Cobalt, buffer, transición sparse→bulk sin entradas obsoletas y equidad
 entre flujos), la caché de `rec_inv_sqrt` bit a bit, la configuración de split

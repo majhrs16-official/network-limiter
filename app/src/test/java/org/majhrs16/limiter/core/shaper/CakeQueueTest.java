@@ -252,6 +252,37 @@ public class CakeQueueTest {
 	}
 
 	@Test
+	public void mixedFlowsDrainAndNewFlowStillRuns() {
+		CakeQueue queue = new CakeQueue(1500, 1_000_000, 80_000_000L, false);
+		FlowKey bulk = key(1);
+		FlowKey sparse = key(2);
+		for (int i = 0; i < 100; i++) {
+			queue.enqueue(item(bulk, 1400), 0);
+		}
+		queue.enqueue(item(sparse, 60), 0);
+
+		long now = 0;
+		int delivered = 0;
+		int expected = 101;
+		for (int i = 0; i < 1_000_000 && delivered < expected; i++) {
+			CakeQueue.Poll poll = queue.poll(now);
+			if (poll.item != null) {
+				delivered++;
+			} else {
+				now += Math.max(1, poll.waitNanos);
+			}
+		}
+		assertEquals(expected, delivered);
+		assertEquals(0L, queue.backlogBytes());
+
+		FlowKey fresh = key(3);
+		queue.enqueue(item(fresh, 500), now);
+		CakeQueue.Poll poll = queue.poll(now);
+		assertNotNull("la cola no planificó el flujo nuevo tras vaciarse", poll.item);
+		assertEquals(fresh, poll.item.flow);
+	}
+
+	@Test
 	public void rateChangeAppliesToQueuedTraffic() {
 		CakeQueue queue = new CakeQueue(1500, 1_000_000, 80_000_000L, false);
 		FlowKey flow = key(1);
