@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+	<string name="app_name">Network Limiter</string>
+	<string name="subtitle">VPN local con control de ancho de banda estilo CAKE</string>
+
+	<string name="status_on">VPN activa</string>
+	<string name="status_off">VPN desconectada</string>
+	<string name="status_hint">Todo el tráfico del dispositivo pasa por el túnel</string>
+
+	<string name="action_start">Activar límite</string>
+	<string name="action_stop">Detener</string>
+
+	<string name="limits_title">Límites</string>
+	<string name="down_label">Bajada</string>
+	<string name="up_label">Subida</string>
+	<string name="preset_slow">1 / 0,5 Mbps</string>
+	<string name="preset_medium">10 / 2 Mbps</string>
+	<string name="preset_fast">50 / 10 Mbps</string>
+	<string name="limits_hint">Se aplican en caliente. CAKE reparte el ancho de banda por flujo y por host; el RTT de referencia ajusta el AQM Cobalt.</string>
+	<string name="rtt_label">RTT de referencia</string>
+	<string name="rtt_value">%1$d ms</string>
+
+	<string name="menu_open">Abrir menú</string>
+	<string name="nav_section">Navegación</string>
+	<string name="nav_main">Límites y tráfico</string>
+	<string name="nav_split">Split tunneling</string>
+	<string name="drawer_subtitle">VPN local · CAKE</string>
+	<string name="drawer_footer">GPL-3.0 · v1.0</string>
+
+	<string name="split_title">Split tunneling</string>
+	<string name="split_subtitle">Elige qué apps pasan por la VPN. Si el túnel está activo, aplicar cambios lo reinicia.</string>
+	<string name="split_all">Todas las apps</string>
+	<string name="split_include">Solo las seleccionadas</string>
+	<string name="split_exclude">Todas excepto las seleccionadas</string>
+	<string name="split_note">Marca o desmarca apps en la lista. La propia app nunca pasa por el túnel.</string>
+	<string name="split_include_empty">No hay apps seleccionadas: se enrutarán todas. Marca al menos una para activar el modo inclusivo.</string>
+	<string name="split_search_hint">Buscar app…</string>
+	<string name="split_show_system">Mostrar apps del sistema</string>
+	<plurals name="split_count">
+		<item quantity="one">%1$d seleccionada</item>
+		<item quantity="other">%1$d seleccionadas</item>
+	</plurals>
+	<string name="split_all_visible">Todas</string>
+	<string name="split_none_visible">Ninguna</string>
+	<string name="split_apply">Aplicar cambios</string>
+	<string name="split_saved">Configuración de split tunneling guardada</string>
+	<string name="split_saved_restart">Guardado. Reiniciando la VPN…</string>
+
+	<string name="traffic_title">Tráfico</string>
+	<string name="down_now">Bajada actual</string>
+	<string name="up_now">Subida actual</string>
+	<string name="down_total">Total bajada</string>
+	<string name="up_total">Total subida</string>
+	<string name="connections_zero">0 conexiones</string>
+	<string name="connections_value">%1$d TCP · %2$d UDP</string>
+	<string name="drops_zero">0 descartes</string>
+	<plurals name="drops_value">
+		<item quantity="one">%1$d descarte AQM</item>
+		<item quantity="other">%1$d descartes AQM</item>
+	</plurals>
+	<string name="zero_time">00:00</string>
+	<string name="zero_rate">0 B/s</string>
+	<string name="zero_bytes">0 B</string>
+
+	<string name="battery_action">Evitar la suspensión del sistema</string>
+	<string name="battery_unavailable">Ajustes de batería no disponibles</string>
+	<string name="footer">El tráfico se procesa en el propio dispositivo: no hay servidor remoto ni se envía nada a terceros. La notificación permanente mantiene el servicio en primer plano y un wake lock evita que el sistema duerma el proceso.</string>
+
+	<string name="channel_name">Túnel VPN</string>
+	<string name="channel_description">Mantiene activo el limitador de red en primer plano</string>
+	<string name="notification_title">Network Limiter activo</string>
+	<string name="vpn_permission_denied">Permiso VPN denegado</string>
+</resources>
